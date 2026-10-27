@@ -189,6 +189,7 @@ python tests/run_all.py realm      # 只跑名字里含 realm 的
 - 227 个套件：168 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - 211 个套件：158 个 Python + 53 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - 227 个套件：168 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 230 个套件：171 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。（合入社区 PR #669 / #670 / #671 / #672 后新增 4 个套件：`_test_error_status_consistency` / `_test_health_readiness` / `_test_cap_mark_any_model` / `_test_no_usable_account_scope`。）
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 

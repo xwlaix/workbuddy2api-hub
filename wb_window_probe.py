@@ -332,6 +332,29 @@ def self_traffic_skip_reason(account, model=""):
     return ""
 
 
+#: 「保留窗口记录」的跳过日志同样要防刷屏：窗口在受限期间一直是「到点」状态，
+#: 而巡检每 30 秒醒一次，不去重就会一直重打同一行。键 (uid, model)，值
+#: (原因, 记日志的时刻)；原因变化或超过 TTL 才再记一次。
+SKIP_LOG_TTL = 1800.0
+_skip_logged = {}
+_skip_logged_lock = threading.Lock()
+
+
+def _log_skip_once(log, uid, model, reason, now=None):
+    """受限 / 区域暂停期间的「跳过」只记一次；原因变化或超过 TTL 再记。"""
+    if log is None:
+        return
+    now = time.time() if now is None else now
+    key = (str(uid or ""), str(model or ""))
+    with _skip_logged_lock:
+        prev = _skip_logged.get(key)
+        if prev and prev[0] == reason and (now - prev[1]) < SKIP_LOG_TTL:
+            return
+        _skip_logged[key] = (reason, now)
+    log("窗口探针：账号 [%s] 的 %s 跳过（%s），保留窗口记录" % (
+        str(uid)[:8], model, reason))
+
+
 def run_due(pool, log=None, limit=BATCH_LIMIT, now=None):
     """执行所有已到点的窗口探针，返回实际发出的探针数。
 
@@ -376,8 +399,7 @@ def _run_due_locked(pool, accounts_dir, log, limit, now):
         # 解封之后到点仍然会把它抢回来（§C 审计 P0-1）。
         skip = self_traffic_skip_reason(account, model)
         if skip:
-            log("窗口探针：账号 [%s] 的 %s 跳过（%s），保留窗口记录" % (
-                uid[:8], model, skip))
+            _log_skip_once(log, uid, model, skip)
             continue
         sent += 1
         try:

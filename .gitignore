@@ -55,5 +55,9 @@ desktop.ini
 .idea/
 .codebuddy/
 
+# 本地补丁部署时留下的原文件备份（`<file>.bak-<时间戳>`，升级/回滚用，不属于源码）。
+# 与 usage/*.bak* 同一口径：留着但不要进仓库，也别为了过 clean-checkout 去删掉。
+*.bak-*
+
 # Local Docker Compose override
 docker-compose.override.yml

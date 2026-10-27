@@ -10263,7 +10263,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.8.4",
+        "version": "1.8.6",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -15524,8 +15524,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                                             cooldown=RESTRICTED_403_COOLDOWN)
                     _persist_restriction(account)
                     log("account %s restricted by upstream (403 11140), "
-                        "cooling %.0fs (persisted)" % (account.uid[:8],
-                                                       RESTRICTED_403_COOLDOWN))
+                        "cooling %.0fs (persisted, hit #%d)" % (
+                            account.uid[:8],
+                            # 冷却时长走阶梯（2h → 8h → 24h），别再固定打印
+                            # RESTRICTED_403_COOLDOWN：排障时会误以为每次都只有 2 小时。
+                            max(0.0, account.restricted_until - time.time()),
+                            getattr(account, "restricted_hits", 1)))
                     if session_key and POOL:
                         POOL.affinity.demote(session_key, account.uid)
                     last_error = exc
@@ -19078,11 +19082,11 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    # 1.8.4 = 本地补丁版（非上游发版）：任务链路 403/11140 落盘 restrictedUntil
+    # 1.8.6 = 本地补丁版（非上游发版）：任务链路 403/11140 落盘 restrictedUntil
     # （wb_accounts.note_restriction_from_error）+ 调度错峰可配
     # （wb_scheduler.SCHEDULER_STAGGER_MIN/_MAX）。两处版本号必须一致，
     # tests/_test_release_engineering.py 钉着这一条。
-    server_version = "wb-proxy/1.8.4"
+    server_version = "wb-proxy/1.8.6"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。

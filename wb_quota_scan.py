@@ -199,6 +199,30 @@ def _seed(scans, wanted, now):
         delay = min(delay + FIRST_STAGGER, FIRST_DELAY_MAX)
 
 
+#: 「跳过」日志的去重窗口：受限期是持续状态，而巡检每 30 秒醒一次；不去重的话
+#: 一个受限账号的每个模型每轮都会打一行，2 小时就是几百行，足以把 40 行控制台
+#: 缓冲冲干净——上游什么都没看到，全是我们自己的日志风暴。
+#: 键是 (uid, model)，值 (原因, 记日志的时刻)；原因变了或超过这个时长才再记。
+SKIP_LOG_TTL = 1800.0
+_skip_logged = {}
+_skip_logged_lock = threading.Lock()
+
+
+def _log_skip_once(log, account, model, reason, now=None):
+    """受限 / 区域暂停期间的「跳过」只记一次；原因变化或超过 TTL 再记。"""
+    if log is None:
+        return
+    now = time.time() if now is None else now
+    key = (str(getattr(account, "uid", "") or ""), str(model or ""))
+    with _skip_logged_lock:
+        prev = _skip_logged.get(key)
+        if prev and prev[0] == reason and (now - prev[1]) < SKIP_LOG_TTL:
+            return
+        _skip_logged[key] = (reason, now)
+    log("额度查询：账号 [%s] 的 %s 跳过（%s）" % (
+        str(account.uid)[:8], model, reason))
+
+
 def due_targets(pool, accounts_dir=None, now=None, limit=BATCH_LIMIT,
                 force=False, log=None):
     """本轮该查的 (账号, 模型) 列表，按应查时刻升序。
@@ -244,21 +268,22 @@ def due_targets(pool, accounts_dir=None, now=None, limit=BATCH_LIMIT,
                 continue  # 账号已不在池中：留着记录，等它回来
             if wb_window_probe.has_window(accounts_dir, account.uid, model):
                 continue  # 已有 429 记录 -> 交给窗口探针处理
-            # 先判「账号级不可出站」再判普通冷却：`throttle_wait()` 也覆盖
-            # restricted_until，但它只是安安静静地 continue —— 号被上游限制了，
-            # 日志里却一个字都没有，正是 §C 审计 P0-2 的现场。放在前面才留得下
-            # 那句话；其余惩罚（熔断 / 降权 / 余额保护 / 模型冷却）仍由下面的
-            # throttle_wait 静默挡掉，行为不变。
+            # 先判「到点没到点」再判「能不能出站」。顺序很重要：`_due_at` 通常
+            # 在未来几小时，而巡检每 30 秒醒一次——反过来的话，受限账号的每个
+            # 模型每轮都会命中 skip 分支并打一行日志，2 小时就是几百行。
+            if not force and now < _due_at(row):
+                continue
+            # 只有真到点了才判「账号级不可出站」：`throttle_wait()` 也覆盖
+            # restricted_until，但它只是安静地 continue —— 号被上游限制了、
+            # 日志里却一个字都没有，正是 §C 审计 P0-2 的现场。在这里留下那句话，
+            # 并按 (uid, model) 去重，避免同一原因每轮重打；其余惩罚（熔断 /
+            # 降权 / 余额保护 / 模型冷却）仍由下面的 throttle_wait 静默挡掉。
             skip = wb_window_probe.self_traffic_skip_reason(account, model)
             if skip:
-                if log is not None:
-                    log("额度查询：账号 [%s] 的 %s 跳过（%s）" % (
-                        str(account.uid)[:8], model, skip))
+                _log_skip_once(log, account, model, skip, now)
                 continue
             if account.throttle_wait(model) > 0:
                 continue  # 正在冷却（含未给出重置时刻的 429、in-flight 的其它惩罚）
-            if not force and now < _due_at(row):
-                continue
             out.append((_due_at(row), account, model))
 
     out.sort(key=lambda item: (item[0], str(item[2])))
