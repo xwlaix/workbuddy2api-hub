@@ -209,18 +209,22 @@ _skip_logged_lock = threading.Lock()
 
 
 def _log_skip_once(log, account, model, reason, now=None):
-    """受限 / 区域暂停期间的「跳过」只记一次；原因变化或超过 TTL 再记。"""
+    """受限 / 区域暂停期间的「跳过」只记一次；原因类别变化或超过 TTL 再记。
+
+    去重键用 `wb_window_probe.skip_reason_key()` 而不是整串：文案里带倒计时，
+    每 30 秒都会变（详见那个函数的说明）。
+    """
     if log is None:
         return
     now = time.time() if now is None else now
-    key = (str(getattr(account, "uid", "") or ""), str(model or ""))
+    uid = str(getattr(account, "uid", "") or "")
+    stable = wb_window_probe.skip_reason_key(account, reason)
     with _skip_logged_lock:
-        prev = _skip_logged.get(key)
-        if prev and prev[0] == reason and (now - prev[1]) < SKIP_LOG_TTL:
+        prev = _skip_logged.get((uid, str(model or "")))
+        if prev and prev[0] == stable and (now - prev[1]) < SKIP_LOG_TTL:
             return
-        _skip_logged[key] = (reason, now)
-    log("额度查询：账号 [%s] 的 %s 跳过（%s）" % (
-        str(account.uid)[:8], model, reason))
+        _skip_logged[(uid, str(model or ""))] = (stable, now)
+    log("额度查询：账号 [%s] 的 %s 跳过（%s）" % (uid[:8], model, reason))
 
 
 def due_targets(pool, accounts_dir=None, now=None, limit=BATCH_LIMIT,

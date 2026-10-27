@@ -345,5 +345,65 @@ class QuotaScanTests(unittest.TestCase):
         self.assertEqual(payload["scans"][0]["model"], "glm-5.3")
 
 
+class SkipLogDedupTests(unittest.TestCase):
+    """「跳过」日志的去重必须穿透动态倒计时。
+
+    这条用例钉的是一个真实回归：`Account.self_traffic_skip_reason()` 返回的是
+    "上游风控限制 剩余 29m50s"，而 `_human_left()` 在 1 小时内精确到秒——
+    调度器每 30 秒一 tick，整串都在变。第一版 `_log_skip_once` 拿整串比对，
+    于是去重永远不命中，受限期间每 30 秒依旧刷一行（最初那条用例传的是固定
+    字符串，正好把这个缺口盖住了）。
+    """
+
+    class _Acc(object):
+        uid = "abcdef12-3456-7890-abcd-ef1234567890"
+        restricted_hits = 1
+
+    def setUp(self):
+        scan._skip_logged.clear()
+        probe._skip_logged.clear()
+
+    def test_a_ticking_countdown_does_not_defeat_dedup(self):
+        acc = self._Acc()
+        lines = []
+        scan._log_skip_once(lines.append, acc, "glm-5.3",
+                            "上游风控限制 剩余 29m50s", now=1000.0)
+        scan._log_skip_once(lines.append, acc, "glm-5.3",
+                            "上游风控限制 剩余 29m20s", now=1030.0)
+        scan._log_skip_once(lines.append, acc, "glm-5.3",
+                            "上游风控限制 剩余 28m50s", now=1060.0)
+        self.assertEqual(len(lines), 1, "倒计时在跳，不该重复记")
+        self.assertIn("29m50s", lines[0], "日志文案仍要带当时的倒计时")
+
+    def test_reason_category_change_logs_again(self):
+        acc = self._Acc()
+        lines = []
+        scan._log_skip_once(lines.append, acc, "glm-5.3",
+                            "上游风控限制 剩余 29m50s", now=1000.0)
+        scan._log_skip_once(lines.append, acc, "glm-5.3", "已停用", now=1010.0)
+        self.assertEqual(len(lines), 2)
+
+    def test_ladder_upgrade_logs_again(self):
+        acc = self._Acc()
+        lines = []
+        scan._log_skip_once(lines.append, acc, "glm-5.3",
+                            "上游风控限制 剩余 29m50s", now=1000.0)
+        acc.restricted_hits = 2          # 2h -> 8h 阶梯升级
+        scan._log_skip_once(lines.append, acc, "glm-5.3",
+                            "上游风控限制 剩余 7h59m", now=1030.0)
+        self.assertEqual(len(lines), 2, "阶梯升级要立刻再记一行")
+
+    def test_window_probe_shares_the_same_key(self):
+        acc = self._Acc()
+        k1 = probe.skip_reason_key(acc, "上游风控限制 剩余 29m50s")
+        k2 = probe.skip_reason_key(acc, "上游风控限制 剩余 29m20s")
+        self.assertEqual(k1, k2)
+        self.assertIn("1", k1)
+        acc.restricted_hits = 3
+        self.assertNotEqual(probe.skip_reason_key(
+            acc, "上游风控限制 剩余 23h59m"), k1)
+        self.assertEqual(probe.skip_reason_key(acc, "已停用"), "已停用")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -340,19 +340,38 @@ _skip_logged = {}
 _skip_logged_lock = threading.Lock()
 
 
-def _log_skip_once(log, uid, model, reason, now=None):
-    """受限 / 区域暂停期间的「跳过」只记一次；原因变化或超过 TTL 再记。"""
+def skip_reason_key(account, reason):
+    """把「跳过原因」压成稳定标识，供日志去重。
+
+    `self_traffic_skip_reason()` 的文案里带动态倒计时（"上游风控限制 剩余 29m50s"
+    / "cn 区域风控暂停 剩余 1770s"），而 `_human_left()` 在 1 小时内精确到秒——
+    每 30 秒一 tick，整串都在变。直接拿整串比对，去重永远不会命中（第一版就是
+    这样：`_log_skip_once` 的用例传的是固定字符串，把这个缺口盖住了）。
+
+    这里只保留「原因类别」；受限这一类再带上阶梯计数，于是：
+      · 同一次限制期内倒计时在跳 → 同一个键，只记一次；
+      · 阶梯升级（2h → 8h → 24h）→ 键变，立刻再记一行，正是排障要看的。
+    """
+    base = str(reason or "").split(" 剩余", 1)[0].strip()
+    if base.startswith("上游风控限制"):
+        return "%s#%s" % (base, getattr(account, "restricted_hits", 1))
+    return base
+
+
+def _log_skip_once(log, account, model, reason, now=None):
+    """受限 / 区域暂停期间的「跳过」只记一次；原因类别变化或超过 TTL 再记。"""
     if log is None:
         return
     now = time.time() if now is None else now
-    key = (str(uid or ""), str(model or ""))
+    uid = str(getattr(account, "uid", "") or "")
+    stable = skip_reason_key(account, reason)
     with _skip_logged_lock:
-        prev = _skip_logged.get(key)
-        if prev and prev[0] == reason and (now - prev[1]) < SKIP_LOG_TTL:
+        prev = _skip_logged.get((uid, str(model or "")))
+        if prev and prev[0] == stable and (now - prev[1]) < SKIP_LOG_TTL:
             return
-        _skip_logged[key] = (reason, now)
+        _skip_logged[(uid, str(model or ""))] = (stable, now)
     log("窗口探针：账号 [%s] 的 %s 跳过（%s），保留窗口记录" % (
-        str(uid)[:8], model, reason))
+        uid[:8], model, reason))
 
 
 def run_due(pool, log=None, limit=BATCH_LIMIT, now=None):
@@ -399,7 +418,7 @@ def _run_due_locked(pool, accounts_dir, log, limit, now):
         # 解封之后到点仍然会把它抢回来（§C 审计 P0-1）。
         skip = self_traffic_skip_reason(account, model)
         if skip:
-            _log_skip_once(log, uid, model, skip)
+            _log_skip_once(log, account, model, skip)
             continue
         sent += 1
         try:
