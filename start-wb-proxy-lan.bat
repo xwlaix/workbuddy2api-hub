@@ -30,6 +30,19 @@ set "SCRIPT=%HERE%wb_proxy.py"
 set "PYARGS=--port %PORT% --lan"
 if not "%KEY%"=="" set "PYARGS=%PYARGS% --api-key %KEY%"
 
+rem ---- anti-ban tuning -------------------------------------------
+rem Wider stagger between accounts in the scheduler. With a small pool
+rem (<=5 accounts) 2~5s can put several accounts inside the same
+rem upstream decision window; 8~20s keeps them apart. Unset = 2~5s.
+if not defined WB_SCHEDULER_STAGGER_MIN set "WB_SCHEDULER_STAGGER_MIN=8"
+if not defined WB_SCHEDULER_STAGGER_MAX set "WB_SCHEDULER_STAGGER_MAX=20"
+rem 403/11140: never rotate to another account inside one request, and
+rem hold the whole realm for 30min once two accounts are restricted.
+if not defined WB_RESTRICTED_403_ROTATE_MAX set "WB_RESTRICTED_403_ROTATE_MAX=0"
+if not defined WB_RESTRICTION_WAVE_MIN set "WB_RESTRICTION_WAVE_MIN=2"
+if not defined WB_RESTRICTION_HOLD_SECONDS set "WB_RESTRICTION_HOLD_SECONDS=1800"
+rem -----------------------------------------------------------------
+
 if not exist "%SCRIPT%" goto no_script
 
 rem ---- explicit visible-console mode ----

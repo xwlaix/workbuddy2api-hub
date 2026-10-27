@@ -24,6 +24,14 @@ set "HERE=%~dp0"
 set "SCRIPT=%HERE%wb_proxy.py"
 set "PYARGS=--port %PORT%"
 
+rem ---- anti-ban tuning (same knobs as the -lan launcher) --------
+if not defined WB_SCHEDULER_STAGGER_MIN set "WB_SCHEDULER_STAGGER_MIN=8"
+if not defined WB_SCHEDULER_STAGGER_MAX set "WB_SCHEDULER_STAGGER_MAX=20"
+if not defined WB_RESTRICTED_403_ROTATE_MAX set "WB_RESTRICTED_403_ROTATE_MAX=0"
+if not defined WB_RESTRICTION_WAVE_MIN set "WB_RESTRICTION_WAVE_MIN=2"
+if not defined WB_RESTRICTION_HOLD_SECONDS set "WB_RESTRICTION_HOLD_SECONDS=1800"
+rem -----------------------------------------------------------------
+
 if not exist "%SCRIPT%" goto no_script
 
 rem ---- explicit visible-console mode ----
