@@ -79,6 +79,14 @@ class RouteTests(unittest.TestCase):
             patcher = mock.patch.object(wb_proxy, target, value)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # 手动批量入口现在账号之间按调度器口径错峰 2~5 秒（§C4）。这组用例只验证
+        # 「名单精确、名单外不碰」，不需要真等，因此把区间压到 0（同时也是
+        # manual_stagger() 确实读调度器常量的证据）。
+        import wb_scheduler
+        for name in ("SCHEDULER_STAGGER_MIN", "SCHEDULER_STAGGER_MAX"):
+            patcher = mock.patch.object(wb_scheduler, name, 0.0)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def call(self, payload):
         handler = self.Handler()

@@ -1523,6 +1523,12 @@ def set_ui_language(accounts_dir, value):
 UPSTREAM_DEFAULTS = {
     "header_timeout_seconds": 120,
     "idle_timeout_seconds": 300,
+    # X-Device-Token 的**全局**来源（字面量或文件），见 wb_accounts.resolve_device_token。
+    # 2026-10 起这只是兜底：更推荐按账号配（账号 JSON 的 deviceToken /
+    # deviceTokenFile）。池子里多于一个账号会用到这个值时，默认口径
+    # （WB_DEVICE_TOKEN_SCOPE=auto）会把它停用并在日志里 WARN——同一个真实设备
+    # token 被多个账号带上线，等于让上游按这一列把整批号 join 成同一台设备，
+    # 比不发这个头更糟。
     "device_token": "",
     "device_token_file": "",
 }

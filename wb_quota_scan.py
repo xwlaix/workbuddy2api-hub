@@ -41,7 +41,11 @@ SCAN_INTERVAL = 6 * 3600
 # 失败的查询不算查过，隔这么久重试。
 RETRY_DELAY = 15 * 60.0
 # 连续失败到这个次数才放弃这一轮（按正常间隔等下一次）。
-MAX_ATTEMPTS = 6
+#:
+#: 从 6 收到 4：一次失败重试 4 次已经把「上游抖动」和「上游真的不放」区分得够
+#: 清楚了，再往后每多一次都是同一个号在同一个节拍上多出一个 chat 请求（§C 审计
+#: P0-2）。命中 403 / 11140 时更早收手 —— 见 `_scan()` 的 restricted 分支。
+MAX_ATTEMPTS = 4
 # 首次登记的配额线要排开，别在勾选的一瞬间把请求全打上去。
 FIRST_DELAY = 5.0
 FIRST_STAGGER = 15.0
@@ -196,7 +200,7 @@ def _seed(scans, wanted, now):
 
 
 def due_targets(pool, accounts_dir=None, now=None, limit=BATCH_LIMIT,
-                force=False):
+                force=False, log=None):
     """本轮该查的 (账号, 模型) 列表，按应查时刻升序。
 
    三条过滤按顺序：**退出观察列表 / 已经计入登记的 429 记录 / 还没到下一次
@@ -240,8 +244,19 @@ def due_targets(pool, accounts_dir=None, now=None, limit=BATCH_LIMIT,
                 continue  # 账号已不在池中：留着记录，等它回来
             if wb_window_probe.has_window(accounts_dir, account.uid, model):
                 continue  # 已有 429 记录 -> 交给窗口探针处理
+            # 先判「账号级不可出站」再判普通冷却：`throttle_wait()` 也覆盖
+            # restricted_until，但它只是安安静静地 continue —— 号被上游限制了，
+            # 日志里却一个字都没有，正是 §C 审计 P0-2 的现场。放在前面才留得下
+            # 那句话；其余惩罚（熔断 / 降权 / 余额保护 / 模型冷却）仍由下面的
+            # throttle_wait 静默挡掉，行为不变。
+            skip = wb_window_probe.self_traffic_skip_reason(account, model)
+            if skip:
+                if log is not None:
+                    log("额度查询：账号 [%s] 的 %s 跳过（%s）" % (
+                        str(account.uid)[:8], model, skip))
+                continue
             if account.throttle_wait(model) > 0:
-                continue  # 正在冷却（含未给出重置时刻的 429）
+                continue  # 正在冷却（含未给出重置时刻的 429、in-flight 的其它惩罚）
             if not force and now < _due_at(row):
                 continue
             out.append((_due_at(row), account, model))
@@ -268,7 +283,7 @@ def run_due(pool, log=None, limit=BATCH_LIMIT, now=None, force=False):
     try:
         stamp = time.time() if now is None else now
         targets = due_targets(pool, accounts_dir, now=stamp, limit=limit,
-                              force=force)
+                              force=force, log=log)
         sent = 0
         for account, model in targets:
             sent += 1
@@ -308,6 +323,16 @@ def _scan(accounts_dir, account, model, log, now=None):
                 detail="")
         log("✓ 额度查询：账号 [%s] 的 %s 正常（未达限额）" % (uid8, model))
         return "ok"
+
+    if wb_window_probe.restricted_now(account):
+        # 403 / code 11140：账号级风控限制。`probe()` 已经把它落到账号上（
+        # note_restriction_from_error），这里立刻停手 —— 不把它当成一次普通失败
+        # 去走 4 次重试，而是按「查过」记一次并推到下一个周期（§C 审计 P0-2）。
+        _record(accounts_dir, uid, model, now, last_scan=now, attempts=0,
+                result="restricted", detail=detail)
+        log("额度查询：账号 [%s] 的 %s 命中上游风控限制，停止查询（下一个周期再试）"
+            % (uid8, model))
+        return "restricted"
 
     row = _row(accounts_dir, uid, model) or {}
     attempts = int(row.get("attempts") or 0)

@@ -39,8 +39,16 @@ PROBE_MAX_TOKENS = 16
 PROBE_TIMEOUT = 60
 
 # 到点后上游可能还没真正放开（服务端时钟/处理延迟），需要重试若干轮。
-MAX_ATTEMPTS = 20
+#:
+#: 重试预算是**硬上限**：过去是 20 次 × 固定 15 秒 —— 一个迟迟不放开的窗口会让
+#: 同一个账号在 5 分钟里被打 20 次，间隔还是精确的 15 秒，正是上游最容易判成
+#: 「自动化重试」的形状（§C 审计 P0-1）。现在 4 次封顶，间隔按
+#: `RETRY_DELAY × 2^(n-1)` 退避（15s → 30s → 60s，封顶 `RETRY_CAP`）。
+MAX_ATTEMPTS = 4
 RETRY_DELAY = 15.0
+#: 单次退避的上限：再往后延没有意义 —— 重置时刻真的到了，上游的 429 会给出新的
+#: reset_at 重新登记，这条记录本来就该结束。
+RETRY_CAP = 120.0
 # 429 给的重置点比「现在 + 这个值」还远，才算上游真的开了一轮新窗口；
 # 否则只是探针发早了，仍按同一轮重试。
 FRESH_WINDOW_MIN = 30.0
@@ -231,6 +239,72 @@ def snapshot(accounts_dir=None, now=None):
 
 # --------------------------------------------------------------- 探针执行
 
+def restriction_hold_remaining(realm, now=None):
+    """该 realm 的整池连坐暂停还剩多少秒（0 = 没有暂停）。
+
+    与 `wb_proxy.restriction_hold_remaining` 同一口径，但必须拿**正在运行的那
+    一份** wb_proxy：网关以 `python wb_proxy.py` 启动时主模块名是 `__main__`，
+    裸 `import wb_proxy` 会再加载一份副本，副本的暂停状态恒为 0（同一处坑见
+    `wb_scheduler._proxy_module`）。拿不到就按 0 处理：看不见的暂停不该把探针
+    一并停掉，那会让配额窗口白等一整轮。
+    """
+    now = time.time() if now is None else now
+    try:
+        import sys
+        module = sys.modules.get("__main__")
+        if module is None or not hasattr(module, "restriction_hold_remaining"):
+            module = sys.modules.get("wb_proxy")
+        if module is None:
+            return 0.0
+        return max(0.0, float(module.restriction_hold_remaining(realm) or 0.0))
+    except Exception:
+        return 0.0
+
+
+def retry_delay(attempts):
+    """第 `attempts` 次失败之后该等多久：15s → 30s → 60s，封顶 RETRY_CAP。"""
+    try:
+        step = max(1, int(attempts))
+    except (TypeError, ValueError):
+        step = 1
+    return min(RETRY_CAP, RETRY_DELAY * (2 ** (step - 1)))
+
+
+def restricted_now(account, now=None):
+    """这个账号刚被上游限制了吗（403 / code 11140 → restricted_until）。
+
+    wb_quota_scan 也用它：两条自发链路的「刚被限制就别再打」必须是同一个判定。
+    """
+    now = time.time() if now is None else now
+    try:
+        return float(getattr(account, "restricted_until", 0.0) or 0.0) > now
+    except (TypeError, ValueError):
+        return False
+
+
+def self_traffic_skip_reason(account, model=""):
+    """这次自发出站（探针 / 额度查询）该不该跳过的原因；空串 = 可以发。
+
+    「该不该唤醒这个账号」的判定只有一份实现（`Account.self_traffic_skip_reason`），
+    这里补上 realm 级的连坐暂停。两条都命中不了才放行。wb_quota_scan 共用它，
+    免得两条链路各判一次、慢慢判出两种口径。
+    """
+    reason = ""
+    checker = getattr(account, "self_traffic_skip_reason", None)
+    if checker is not None:
+        try:
+            reason = str(checker(model=model) or "")
+        except Exception:
+            reason = ""
+    if reason:
+        return reason
+    hold = restriction_hold_remaining(getattr(account, "realm", ""))
+    if hold > 0:
+        return "%s 区域风控暂停 剩余 %ds" % (
+            getattr(account, "realm", "?"), int(hold + 0.5))
+    return ""
+
+
 def run_due(pool, log=None, limit=BATCH_LIMIT, now=None):
     """执行所有已到点的窗口探针，返回实际发出的探针数。
 
@@ -269,6 +343,14 @@ def _run_due_locked(pool, accounts_dir, log, limit, now):
             continue
         if not account.enabled or not account.access_token:
             # 停用或无凭证的账号不该被自动唤醒：保留记录，等它被重新启用。
+            continue
+        # 上游风控限制 / 区域连坐暂停期间一律不碰上游。探针是纯机器节奏的自发
+        # 流量，在被限制的号上多打一次就是在替上游确认「这是机器」；记录保留，
+        # 解封之后到点仍然会把它抢回来（§C 审计 P0-1）。
+        skip = self_traffic_skip_reason(account, model)
+        if skip:
+            log("窗口探针：账号 [%s] 的 %s 跳过（%s），保留窗口记录" % (
+                uid[:8], model, skip))
             continue
         sent += 1
         try:
@@ -312,6 +394,15 @@ def _fire(accounts_dir, account, model, log):
                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(reset_at))))
         return
 
+    if restricted_now(account):
+        # 403 / code 11140：账号级风控限制，`_probe` 已把它落到账号上。这里立刻
+        # 收手并撤销窗口 —— 探针是这个模块唯一的出站理由，被限制期间一次都不该
+        # 再发；下一次真实 429 会重新登记。
+        drop(accounts_dir, uid, model)
+        log("窗口探针：账号 [%s] 的 %s 命中上游风控限制，停止探测并撤销窗口"
+            "（下一次 429 会重新登记）" % (uid8, model))
+        return
+
     row = _get(accounts_dir, uid, model) or {}
     attempts = int(row.get("attempts") or 0) + 1
     if attempts >= MAX_ATTEMPTS:
@@ -319,11 +410,12 @@ def _fire(accounts_dir, account, model, log):
         log("窗口探针：账号 [%s] 的 %s 连续 %d 次未重置，放弃（下一次 429 会重新登记）"
             % (uid8, model, attempts))
         return
-    next_at = time.time() + RETRY_DELAY
+    delay = retry_delay(attempts)
+    next_at = time.time() + delay
     _update(accounts_dir, uid, model, reset_at=next_at, attempts=attempts,
             last_result=detail)
     log("窗口探针：账号 [%s] 的 %s 尚未重置（%s），%d 秒后重试 (%d/%d)"
-        % (uid8, model, detail or "无详情", int(RETRY_DELAY), attempts, MAX_ATTEMPTS))
+        % (uid8, model, detail or "无详情", int(delay), attempts, MAX_ATTEMPTS))
 
 
 def _probe(account, model):
@@ -361,6 +453,14 @@ def _probe(account, model):
             detail = ""
         if exc.code == 429:
             return False, wb_proxy.parse_rate_limit_reset(detail), detail[:200]
+        # 403 / code 11140 是账号级风控限制：就地落到账号上（判定与落盘只有一份
+        # 实现，与签到 / 每日活跃 / 网页会话 / 任务链共用），再由 `_fire` 立刻
+        # 停手。探针是自动化流量，在被限制的号上多打一次都是在替上游确认
+        # 「这是机器」（§C 审计 P0-1）。
+        try:
+            account.note_restriction_from_error(exc.code, detail)
+        except Exception:
+            pass
         return False, None, "HTTP %d: %s" % (exc.code, detail[:120])
     except Exception as exc:
         return False, None, str(exc)[:200]

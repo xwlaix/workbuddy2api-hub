@@ -21,8 +21,12 @@ account has been restricted due to unusual activity","zh":"账号存在异常行
   4. 内容审核 403 的原路径不变（降级重试、透传，不给账号上长冷却）；
   5. 一切 >=500 的未知状态码（实测 550）也按瞬时故障轮转；
   6. 池里只有这一个账号时，仍把限制原因交给客户端。
-  7. 换号重试时 CLI 身份的 X-Conversation-Request-ID 整轮复用、message id 每
-     请求新生成，桌面端身份保持原样（官方 CLI 2.168.2 对齐的回归钉）。
+  7. 换号重试时 CLI 身份的 X-Conversation-Request-ID / X-Root-Request-ID **按账号
+     隔离**（每次尝试新生成、同一次尝试内自洽），message id 每请求新生成，会话
+     id 按 (账号, 会话键) 派生，桌面端身份保持原样（官方 CLI 2.168.2 对齐的回归
+     钉）。交叉复用一个 request id 会把「两个账号属于同一批」写进请求头。
+  8. 换号重试之间插一段带抖动的短延迟（wb_proxy.rotation_delay），不把同一份
+     body 在同一秒送到下一个账号；本文件用例把它关掉，只看处置口径与出站形态。
 
 Run with the current interpreter (python tests/run_all.py restricted).
 """
@@ -186,6 +190,11 @@ class Restricted403DispatchTests(unittest.TestCase):
         self.old_min = P.RESTRICTION_WAVE_MIN
         self.old_window = P.RESTRICTION_WAVE_WINDOW
         self.old_hold = P.RESTRICTION_HOLD_SECONDS
+        # 换号重试现在会睡 0.8~2.5 秒（wb_proxy.rotation_delay），让同一份 body
+        # 不要在同一秒落到下一个号上。这些用例验证的是处置口径与出站形态，
+        # 不是重试节奏，所以把延迟关掉（否则整个文件白等十几秒）。
+        self.old_delay = (P.RETRY_ROTATE_DELAY_MIN, P.RETRY_ROTATE_DELAY_MAX)
+        P.RETRY_ROTATE_DELAY_MIN = P.RETRY_ROTATE_DELAY_MAX = 0.0
         P.RESTRICTED_403_ROTATE_MAX = 0
         P.RESTRICTION_WAVE_MIN = 2
         P.RESTRICTION_WAVE_WINDOW = 900.0
@@ -198,6 +207,7 @@ class Restricted403DispatchTests(unittest.TestCase):
         P.RESTRICTION_WAVE_MIN = self.old_min
         P.RESTRICTION_WAVE_WINDOW = self.old_window
         P.RESTRICTION_HOLD_SECONDS = self.old_hold
+        P.RETRY_ROTATE_DELAY_MIN, P.RETRY_ROTATE_DELAY_MAX = self.old_delay
         P.reset_restriction_state()
 
     def _run(self, accounts, script):
@@ -332,12 +342,15 @@ class IdentityOnRetryTests(unittest.TestCase):
         # 默认已改为「11140 不换号」；这组用例只验证换号后的身份形态，
         # 显式打开旧的透明轮转开关。
         self._old_rotate = P.RESTRICTED_403_ROTATE_MAX
+        self._old_delay = (P.RETRY_ROTATE_DELAY_MIN, P.RETRY_ROTATE_DELAY_MAX)
+        P.RETRY_ROTATE_DELAY_MIN = P.RETRY_ROTATE_DELAY_MAX = 0.0
         P.RESTRICTED_403_ROTATE_MAX = 1
 
     def tearDown(self):
         P.RESTRICTED_403_ROTATE_MAX = self._old_rotate
+        P.RETRY_ROTATE_DELAY_MIN, P.RETRY_ROTATE_DELAY_MAX = self._old_delay
 
-    def test_cli_turn_request_id_survives_the_account_switch(self):
+    def test_cli_turn_request_id_is_isolated_per_account(self):
         upstream, resp, raised = run_switch(
             [make_cli_account("r1"), make_cli_account("h1")],
             [http_error(403, RESTRICT_BODY), FakeResp()])
@@ -346,13 +359,19 @@ class IdentityOnRetryTests(unittest.TestCase):
         self.assertEqual(len(upstream.calls), 2)
         first = request_headers(upstream.calls[0])
         second = request_headers(upstream.calls[1])
-        # 一轮 user send 的 request id 在整轮（含换号重试）复用同一个值。
+        # 一轮 user send 的 request id **按账号隔离**：换号重试必须换一个新值，
+        # 否则上游会在同一个出口 IP 上看到「两个不同账号收到同一个
+        # X-Conversation-Request-ID / X-Root-Request-ID」——那是替上游把
+        # 「这两个号是同一批」写进请求头（社区复盘 #629/#664）。
         self.assertTrue(first["x-conversation-request-id"])
-        self.assertEqual(first["x-conversation-request-id"],
-                         second["x-conversation-request-id"])
-        # 主对话也发 X-Root-Request-ID，值 = 本轮 conversation request id。
+        self.assertTrue(second["x-conversation-request-id"])
+        self.assertNotEqual(first["x-conversation-request-id"],
+                            second["x-conversation-request-id"])
+        # 每次尝试内部自洽：主对话的 root id = 本次 conversation request id。
         self.assertEqual(first["x-root-request-id"],
                          first["x-conversation-request-id"])
+        self.assertEqual(second["x-root-request-id"],
+                         second["x-conversation-request-id"])
         # message id 每请求新生成；会话 id 按账号隔离（换号就换会话）。
         self.assertEqual(first["x-request-id"], first["x-conversation-message-id"])
         self.assertNotEqual(first["x-request-id"], second["x-request-id"])
@@ -366,7 +385,18 @@ class IdentityOnRetryTests(unittest.TestCase):
         self.assertEqual(first["x-private-data"], "false")
         self.assertEqual(first["x-stainless-lang"], "js")
         self.assertEqual(first["x-stainless-package-version"], "6.25.0")
-        self.assertEqual(first["x-stainless-runtime-version"], "v22.21.1")
+        # 宿主画像（os / arch / runtime-version）按账号派生，见
+        # wb_identity.client_profile()：这里只能钉形态，钉不了固定字面量——原来的
+        # "v22.21.1" 是「x-stainless 取宿主机值」时代的产物，一个实例上一个值，
+        # 正是上游用来判定「同一台机器」的证据。真实形态是 process.version，
+        # 即带 v 前缀的 18/20/22/23 线真实版本号。
+        self.assertRegex(first["x-stainless-runtime-version"],
+                         r"^v(18|20|22|23)\.\d+\.\d+$")
+        # 同号恒定：同一个账号再取一次 header，画像与第一次相同（派生的，不是随机）。
+        again = make_cli_account("r1").headers(purpose="chat")
+        self.assertEqual((again["x-stainless-os"], again["x-stainless-runtime-version"]),
+                         (first["x-stainless-os"],
+                          first["x-stainless-runtime-version"]))
         self.assertTrue(first["x-b3-parentspanid"])
         # 官方 CLI 的 chat 没有浏览器头，Accept 就是 application/json。
         self.assertEqual(first["accept"], "application/json")

@@ -164,17 +164,33 @@ def fake_fetch(realm=None):
 
 
 P.fetch_models = fake_fetch
+# §D5 收尾：一键配置清单与 /v1/models 走同一个 advertised_reasoning()，只广告
+# **上游自己声明过**的档位。这条路径的 live 口径由目录构建时记录；桩 fetch 不会
+# 走那段流程，所以这里显式喂一份 live 声明（与真实安装里 note_live_reasoning()
+# 写进去的形状一致）。
+_saved_live = dict(P._live_reasoning)
+P.note_live_reasoning("intl", [
+    ("m-thinky", {"reasoning": {"supportedEfforts": ["low", "high"]}}),
+    ("m-fixed", {"reasoning": {"effort": "medium"}}),
+])
 try:
     listed = P.Handler._agents_models(None)
 finally:
     P.fetch_models = real_fetch
+    P._live_reasoning.clear()
+    P._live_reasoning.update(_saved_live)
 by_id2 = {m["id"]: m for m in listed}
 check("有 supportedEfforts 的模型宣告档位列表",
       by_id2.get("m-thinky", {}).get("reasoning_efforts") == ["low", "high"],
       by_id2.get("m-thinky"))
-check("固定档位的模型不宣告档位",
-      "reasoning_efforts" not in by_id2.get("m-fixed", {}),
+# 旧断言是「固定档位的模型不宣告档位」。§D5 改成「只声明一档就只给那一档」：
+# 只广告 ["medium"]，客户端因此选不到上游不会跑的其它档位。
+check("只声明一个固定档的模型只宣告那一档",
+      by_id2.get("m-fixed", {}).get("reasoning_efforts") == ["medium"],
       by_id2.get("m-fixed"))
+check("目录里没有 live 声明的模型不宣告档位",
+      "reasoning_efforts" not in by_id2.get("glm-5.3", {}),
+      by_id2.get("glm-5.3"))
 check("context_window 走与 /v1/models 同一条查找链（知识表兜底）",
       by_id2.get("glm-5.3", {}).get("context_window") == 1000000,
       by_id2.get("glm-5.3"))

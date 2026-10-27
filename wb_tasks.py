@@ -6,6 +6,7 @@
 3. 猫猫旅行 (buddy travel) 状态查询、自动派出与自动领奖。
 4. 严格遵守 >= 1.0s 防风控间隔，并使用 wb_fingerprint 的稳定设备指纹。
 """
+import io
 import json
 import re
 import time
@@ -37,6 +38,52 @@ def set_logger(fn):
     """
     global _log
     _log = fn or (lambda msg: None)
+
+
+def _note_http_error(account, exc, body=b""):
+    """把一次 403 交给账号的受限判定（落盘 restrictedUntil）；返回是否识别到。
+
+    判定与落盘只有一份实现（`Account.note_restriction_from_error`，与签到 /
+    每日活跃 / 网页会话三条直连路径共用），这里只负责把正文解码，并保证形状
+    奇怪的异常对象不会把出站路径带崩。
+    """
+    note = getattr(account, "note_restriction_from_error", None)
+    if note is None:
+        return False
+    try:
+        if isinstance(body, bytes):
+            body = body.decode("utf-8", "replace")
+        return bool(note(getattr(exc, "code", 0) or 0, body or ""))
+    except Exception:
+        return False
+
+
+def _open(account, req, timeout=15):
+    """本模块**唯一**的出站入口：把账号级风控限制就地交给账号。
+
+    这个模块的每条直连出站都用 `try/except` 把 HTTP 错误压成字符串（20 个调用
+    点、二十多处 except），于是 403 / code 11140 只当一次普通失败：
+    `restrictedUntil` 永远是 0，调度器「跳过受限账号」对旅行 / 连登 / 成长任务
+    这几条最频繁的链路完全失效（§C 审计 P0-4）。现在判定与落盘统一走
+    `Account.note_restriction_from_error`，各任务自己的容错语义一点不变。
+
+    只有 403 会触发判定，其余错误**原样抛出、不读正文**：既有分支的报错文案与
+    `exc.read()` 行为与本函数不存在时完全一致。403 的正文已经被读出用于判定，
+    这里用一个带同样字节的新异常把它接回去，免得调用方拿到一个读不出内容的
+    403、把「账号被限制」显示成空原因。
+    """
+    try:
+        return _accounts.urlopen(req, timeout=timeout, proxy=account.proxy)
+    except urllib.error.HTTPError as exc:
+        if getattr(exc, "code", 0) != 403:
+            raise
+        try:
+            body = exc.read(2000)
+        except Exception:
+            body = b""
+        _note_http_error(account, exc, body)
+        raise urllib.error.HTTPError(exc.url, exc.code, exc.msg, exc.hdrs,
+                                     io.BytesIO(body))
 
 TASK_SPECS = {
     "create_canvas": {"kind": "canvas", "target": 1, "reward": 300, "name": "创建设计任务"},
@@ -120,7 +167,7 @@ def fetch_growth_tasks(account):
     url = CHAT_BASE + "/v2/activity/growth/tasks"
     req = urllib.request.Request(url, headers=account.headers("chat"))
     try:
-        with _accounts.urlopen(req, timeout=15, proxy=account.proxy) as resp:
+        with _open(account, req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             raw_tasks = (data.get("data") or {}).get("tasks") or []
             tasks = []
@@ -154,7 +201,7 @@ def fetch_growth_summary(account):
     # 1. 能量
     try:
         req = urllib.request.Request(CHAT_BASE + "/v2/activity/growth/energy", headers=headers)
-        with _accounts.urlopen(req, timeout=10, proxy=account.proxy) as resp:
+        with _open(account, req, timeout=10) as resp:
             d = json.loads(resp.read().decode("utf-8"))
             out["energy"] = (d.get("data") or {}).get("balance", 0)
     except Exception as exc:
@@ -162,7 +209,7 @@ def fetch_growth_summary(account):
     # 2. 连续打卡、连登档位、补签卡与抽奖
     try:
         req = urllib.request.Request(CHAT_BASE + "/activity/growth/streak", headers=headers)
-        with _accounts.urlopen(req, timeout=10, proxy=account.proxy) as resp:
+        with _open(account, req, timeout=10) as resp:
             d = json.loads(resp.read().decode("utf-8"))
             data = d.get("data") or {}
             st = data.get("streak") or {}
@@ -179,7 +226,7 @@ def fetch_growth_summary(account):
         _log(f"growth/streak query failed: {exc}")
     try:
         req = urllib.request.Request(CHAT_BASE + "/activity/growth/lottery/summary", headers=headers)
-        with _accounts.urlopen(req, timeout=10, proxy=account.proxy) as resp:
+        with _open(account, req, timeout=10) as resp:
             d = json.loads(resp.read().decode("utf-8"))
             out["lottery_chances"] = (d.get("data") or {}).get("chances", 0)
     except Exception as exc:
@@ -187,7 +234,7 @@ def fetch_growth_summary(account):
     # 3. 猫猫旅行
     try:
         req = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/status", headers=headers)
-        with _accounts.urlopen(req, timeout=10, proxy=account.proxy) as resp:
+        with _open(account, req, timeout=10) as resp:
             d = json.loads(resp.read().decode("utf-8"))
             out["travel"] = d.get("data") or {}
     except Exception as exc:
@@ -205,7 +252,7 @@ def fetch_streak_days(account):
         base = account.chat_base_url() if hasattr(account, "chat_base_url") else CHAT_BASE
         req = urllib.request.Request(base + "/activity/growth/streak",
                                      headers=account.headers("chat"))
-        with _accounts.urlopen(req, timeout=10, proxy=account.proxy) as resp:
+        with _open(account, req, timeout=10) as resp:
             d = json.loads(resp.read().decode("utf-8"))
             st = (d.get("data") or {}).get("streak") or {}
             return st.get("days")
@@ -232,7 +279,7 @@ def accept_tasks(account, codes, chunk=20):
         req = urllib.request.Request(url, data=body, method="POST",
                                      headers=account.headers("chat"))
         try:
-            with _accounts.urlopen(req, timeout=15, proxy=account.proxy) as resp:
+            with _open(account, req, timeout=15) as resp:
                 d = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = ""
@@ -282,7 +329,7 @@ def claim_task(account, code):
     url = f"{CHAT_BASE}/activity/growth/tasks/{code}/claim"
     req = urllib.request.Request(url, data=b"{}", method="POST", headers=account.headers("chat"))
     try:
-        with _accounts.urlopen(req, timeout=15, proxy=account.proxy) as resp:
+        with _open(account, req, timeout=15) as resp:
             d = json.loads(resp.read().decode("utf-8"))
             if d.get("code") == 0:
                 data = d.get("data") or {}
@@ -313,7 +360,7 @@ def claim_task(account, code):
             }
             try:
                 req_web = urllib.request.Request(web_url, data=b"{}", method="POST", headers=web_hdrs)
-                with _accounts.urlopen(req_web, timeout=15, proxy=account.proxy) as resp:
+                with _open(account, req_web, timeout=15) as resp:
                     d = json.loads(resp.read().decode("utf-8"))
                     if d.get("code") == 0:
                         data = d.get("data") or {}
@@ -412,7 +459,7 @@ def report_events(account, events, base=None):
     body = json.dumps(events).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST", headers=headers)
     try:
-        with _accounts.urlopen(req, timeout=15, proxy=account.proxy) as resp:
+        with _open(account, req, timeout=15) as resp:
             d = json.loads(resp.read().decode("utf-8"))
             return d.get("code") == 0
     except Exception:
@@ -422,7 +469,7 @@ def report_events(account, events, base=None):
 def _travel_status(account):
     req = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/status",
                                  headers=account.headers("chat"))
-    with _accounts.urlopen(req, timeout=10, proxy=account.proxy) as resp:
+    with _open(account, req, timeout=10) as resp:
         d = json.loads(resp.read().decode("utf-8"))
         return d.get("data") or {}
 
@@ -451,7 +498,7 @@ def _travel_depart(account, lid):
     req = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/depart",
                                  data=body, method="POST", headers=account.headers("chat"))
     try:
-        with _accounts.urlopen(req, timeout=10, proxy=account.proxy) as resp:
+        with _open(account, req, timeout=10) as resp:
             res = json.loads(resp.read().decode("utf-8"))
         if res.get("code") == 0:
             return res.get("data") or {}, None
@@ -487,7 +534,7 @@ def do_cat_travel(account):
         # 领奖 (官方前端: POST travel/claim body {})
         req_cl = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/claim", data=b"{}", method="POST", headers=headers)
         try:
-            with _accounts.urlopen(req_cl, timeout=10, proxy=account.proxy) as resp:
+            with _open(account, req_cl, timeout=10) as resp:
                 c_res = json.loads(resp.read().decode("utf-8"))
                 credit = (c_res.get("data") or {}).get("reward_credit", 0)
                 account.fetch_credits()
@@ -503,7 +550,7 @@ def do_cat_travel(account):
         lid = None
         try:
             req_cfg = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/config", headers=headers)
-            with _accounts.urlopen(req_cfg, timeout=10, proxy=account.proxy) as resp:
+            with _open(account, req_cfg, timeout=10) as resp:
                 cfg = json.loads(resp.read().decode("utf-8"))
                 locs = (cfg.get("data") or {}).get("locations") or []
             if locs:
@@ -806,7 +853,7 @@ def run_streak_bonus(account):
     # 0. 检查昨日漏签并自动补签
     try:
         req_hm = urllib.request.Request(CHAT_BASE + "/activity/growth/heatmap", headers=headers)
-        with _accounts.urlopen(req_hm, timeout=10, proxy=account.proxy) as resp:
+        with _open(account, req_hm, timeout=10) as resp:
             hm_data = json.loads(resp.read().decode("utf-8"))
             cells = (hm_data.get("data") or {}).get("cells", [])
             yesterday_str = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
@@ -814,14 +861,14 @@ def run_streak_bonus(account):
             if y_cell and y_cell.get("score", 0) == 0:
                 # 查是否有补签卡
                 req_st = urllib.request.Request(CHAT_BASE + "/activity/growth/streak", headers=headers)
-                with _accounts.urlopen(req_st, timeout=10, proxy=account.proxy) as st_resp:
+                with _open(account, req_st, timeout=10) as st_resp:
                     st_data = json.loads(st_resp.read().decode("utf-8"))
                     cards = ((st_data.get("data") or {}).get("makeup_cards") or {}).get("balance", 0)
                     if cards > 0:
                         body = json.dumps({"target_date": yesterday_str}).encode("utf-8")
                         req_use = urllib.request.Request(CHAT_BASE + "/activity/growth/makeup-cards/use",
                                                          data=body, method="POST", headers=headers)
-                        with _accounts.urlopen(req_use, timeout=10, proxy=account.proxy) as use_resp:
+                        with _open(account, req_use, timeout=10) as use_resp:
                             logs.append(f"已消耗 1 张补签卡补签昨日 ({yesterday_str})")
     except Exception as exc:
         _log(f"makeup yesterday failed: {exc}")
@@ -832,7 +879,7 @@ def run_streak_bonus(account):
                        ("/billing/meter/claim-compensation", "活动补偿")]:
         try:
             req_g = urllib.request.Request(BILL_BASE + path, data=b"{}", method="POST", headers=b_hdrs)
-            with _accounts.urlopen(req_g, timeout=10, proxy=account.proxy) as resp:
+            with _open(account, req_g, timeout=10) as resp:
                 d = json.loads(resp.read().decode("utf-8"))
                 if d.get("code") == 0:
                     cr = (d.get("data") or {}).get("credit", 0)
@@ -843,7 +890,7 @@ def run_streak_bonus(account):
     # 2. 检查 7d/14d/28d 连登档位兑换
     try:
         req_st = urllib.request.Request(CHAT_BASE + "/activity/growth/streak", headers=headers)
-        with _accounts.urlopen(req_st, timeout=10, proxy=account.proxy) as resp:
+        with _open(account, req_st, timeout=10) as resp:
             st_data = json.loads(resp.read().decode("utf-8"))
             redemp = (st_data.get("data") or {}).get("redemption_status") or {}
             tiers = redemp.get("tiers", [])
@@ -862,7 +909,7 @@ def run_streak_bonus(account):
                 req_rd = urllib.request.Request(CHAT_BASE + "/activity/growth/redeem",
                                                 data=body, method="POST", headers=headers)
                 try:
-                    with _accounts.urlopen(req_rd, timeout=10, proxy=account.proxy) as rd_resp:
+                    with _open(account, req_rd, timeout=10) as rd_resp:
                         rd_json = json.loads(rd_resp.read().decode("utf-8"))
                         if rd_json.get("code") == 0:
                             logs.append(f"成功兑换连登 {tier_name} 档位")
@@ -875,7 +922,7 @@ def run_streak_bonus(account):
     drawn_count = 0
     try:
         req_lot = urllib.request.Request(CHAT_BASE + "/activity/growth/lottery/summary", headers=headers)
-        with _accounts.urlopen(req_lot, timeout=10, proxy=account.proxy) as resp:
+        with _open(account, req_lot, timeout=10) as resp:
             lot_data = json.loads(resp.read().decode("utf-8"))
             chances = (lot_data.get("data") or {}).get("chances", 0)
             import uuid
@@ -884,7 +931,7 @@ def run_streak_bonus(account):
                 req_draw = urllib.request.Request(CHAT_BASE + "/activity/growth/lottery/draw",
                                                   data=body, method="POST", headers=headers)
                 try:
-                    with _accounts.urlopen(req_draw, timeout=10, proxy=account.proxy) as draw_resp:
+                    with _open(account, req_draw, timeout=10) as draw_resp:
                         d_res = json.loads(draw_resp.read().decode("utf-8"))
                         if d_res.get("code") == 0:
                             drawn_count += 1

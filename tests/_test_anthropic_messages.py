@@ -82,7 +82,7 @@ _sys = chat["messages"][0]["content"]
 check("system blocks are joined and note appended",
       _sys.startswith("sys-a\nsys-b") and "web_search" in _sys, chat["messages"][0])
 check("stop_sequences map to stop", chat.get("stop") == ["END"], chat.get("stop"))
-check("metadata.user_id maps to user", chat.get("user") == "u", chat.get("user"))
+check("metadata.user_id is NOT lifted to user (§D3)", chat.get("user") is None, chat.get("user"))
 check("parallel tool calls are disabled", chat.get("parallel_tool_calls") is False, chat.get("parallel_tool_calls"))
 check("effort maps from output_config", chat.get("reasoning_effort") == "high", chat.get("reasoning_effort"))
 check("top_k is dropped", "top_k" not in chat, chat)

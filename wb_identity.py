@@ -35,7 +35,8 @@
        productName 段；adapter 先删掉 SDK 的 user-agent，CLI 也没有
        userAgentExtension，所以没有第三段）
      - OpenAI Node SDK 6.25.0 的 x-stainless-* 指纹头（见
-       cli_stainless_headers()；OS/arch/node 版本默认取宿主，可用
+       cli_stainless_headers()；OS/arch/node 版本默认按账号派生
+       （client_profile()，开关 WB_CLIENT_PROFILE_PER_ACCOUNT），也可用
        WB_IDENTITY_OS / WB_IDENTITY_ARCH / WB_IDENTITY_NODE_VERSION 覆盖）
      - X-Private-Data：个人号 false、企业号 true（官方 getCustomHeaders 默认值）
      - chat 请求体：JSON.stringify 紧凑形态 + gzip（productFeatures.RequestBodyGzip）
@@ -55,6 +56,7 @@ code 11-128（`conversation id missing`）。ID 形态按 5.8.4 实测：会话 
 连字符的 UUID，请求/消息 id 是 32 位无连字符 hex（UUIDv7），见 uuid7。
 """
 
+import collections
 import gzip
 import hashlib
 import io
@@ -64,6 +66,8 @@ import secrets
 import threading
 import time
 import uuid
+
+import wb_fingerprint
 
 # 5.8.4 实测（国际版桌面客户端抓包）: 对话请求的版本号与 UA。
 # UA 末段 CLI/2.161.0 是客户端内置 CLI 的版本，不是桌面端自己的版本。
@@ -93,11 +97,28 @@ DEFAULT_IDE_VERSION = "2.168.2"
 #: 的入参是空串，最终只有两段。
 #: 官方 CLI 的 chat 请求由 OpenAI Node SDK 6.25.0 发出，SDK 自带的一组
 #: X-Stainless-* 指纹头。值取自 SDK 6.25.0 的默认值；OS / Arch / Runtime-Version
-#: 本来由 SDK 按宿主机生成，这里默认取网关宿主（与 TLS/网络栈一致），可用
-#: WB_IDENTITY_OS / WB_IDENTITY_ARCH / WB_IDENTITY_NODE_VERSION 覆盖。
+#: 官方是照**宿主机**现取的（process.platform / process.arch / process.version），
+#: 网关若照抄宿主机值，同一实例上的所有账号就会发出同样的 OS/arch/Node 版本——
+#: 那在服务端就是「同一台机器」的直接证据。所以默认**按账号派生**（见
+#: client_profile()）；仍可用 WB_IDENTITY_OS / WB_IDENTITY_ARCH /
+#: WB_IDENTITY_NODE_VERSION 显式钉住（钉住的值永远优先）。
 #: 头名按官方 wire 小写（SDK 的 Headers 迭代时键已小写化）。
+def _env_identity_os():
+    return str(os.environ.get("WB_IDENTITY_OS") or "").strip()
+
+
+def _env_identity_arch():
+    return str(os.environ.get("WB_IDENTITY_ARCH") or "").strip()
+
+
+def _pinned_node_version():
+    """显式钉住的 Node 版本：面板 identity_versions["node"] 或 WB_IDENTITY_NODE_VERSION。"""
+    return (str(_VERSION_OVERRIDES.get("node") or "").strip()
+            or str(os.environ.get("WB_IDENTITY_NODE_VERSION") or "").strip())
+
+
 def _identity_os():
-    override = str(os.environ.get("WB_IDENTITY_OS") or "").strip()
+    override = _env_identity_os()
     if override:
         return override
     system = platform.system()
@@ -106,7 +127,7 @@ def _identity_os():
 
 
 def _identity_arch():
-    override = str(os.environ.get("WB_IDENTITY_ARCH") or "").strip()
+    override = _env_identity_arch()
     if override:
         return override
     machine = (platform.machine() or "").lower()
@@ -115,23 +136,132 @@ def _identity_arch():
         machine, machine or "x64")
 
 
+def _runtime_version():
+    """x-stainless-runtime-version：钉住的版本优先，否则模块默认（v22.21.1）。"""
+    return _pinned_node_version() or node_version()
+
+
+#: 宿主画像（x-stainless-os / -arch / -runtime-version）是否按账号派生。默认 1/开。
+#:
+#: 为什么默认开：上游判断「这批账号是不是同一批 / 同一台机器」时，正是拿这几个
+#: 头做比对。官方 SDK 一台真机一个值（process.platform / process.arch /
+#: process.version）；网关是一个长驻进程冒充几十台设备，如果照 SDK 的原生语义
+#: 取**宿主机**值，同一实例上所有账号发出的 OS / arch / Node 版本一字不差，等于
+#: 我们主动把账号池的关联键写进请求头（与 wb_fingerprint 按 uid 隔离设备是同一个
+#: 口径）。派生后同一账号恒定、不同账号互不相同。
+#:
+#: 设 0 回到旧行为：取宿主机值（与进程的 TLS / 网络栈一致）。运维显式钉住的
+#: WB_IDENTITY_OS / WB_IDENTITY_ARCH / 面板 identity_versions["node"] /
+#: WB_IDENTITY_NODE_VERSION 任何时候都优先，派生值不会覆盖它们。
+CLIENT_PROFILE_ENV = "WB_CLIENT_PROFILE_PER_ACCOUNT"
+
+#: 一次派生的结果：一台「客户端机器」的三个宿主特征。
+ClientProfile = collections.namedtuple("ClientProfile",
+                                       "os arch node_version")
+
+#: 官方 SDK 真实会出现的取值域。三项分别从同一份 uid 派生值里取，但取值域本身
+#: 保证「官方发得出来」：
+#:   - os 是 process.platform 的映射：win32→Windows、darwin→MacOS、linux→Linux；
+#:   - arch 是 process.arch：x64 / arm64（ia32 自 Node 16 起官方停发预编译包，
+#:     官方 SDK 的用户群基本不再出现，故不列）；
+#:   - node_version 是 process.version（带 v 前缀），只取线上真实发布过的版本号，
+#:     不造不存在的号。
+#: arch 的表按 os 分开（_ARCH_WEIGHTS），所以派生不出 "MacOS + win32"、
+#: "Windows + aarch64" 这种官方根本发不出来的组合；权重按真实机器的常见程度排：
+#: Windows x64 / Apple Silicon / Linux x64 是主流，Mac x64（Intel 机）、
+#: Linux arm64、Windows on ARM 是少数派。
+_OS_WEIGHTS = (("Windows", 55), ("MacOS", 32), ("Linux", 13))
+_ARCH_WEIGHTS = {
+    "Windows": (("x64", 92), ("arm64", 8)),
+    "MacOS": (("arm64", 85), ("x64", 15)),
+    "Linux": (("x64", 78), ("arm64", 22)),
+}
+_CLIENT_NODE_VERSIONS = (
+    "v22.21.1", "v22.14.0", "v22.13.0", "v22.12.0",
+    "v22.11.0", "v20.18.1", "v18.20.4", "v23.11.0",
+)
+
+#: 派生盐。与 wb_fingerprint 里 machine / session 的盐并列但互不相同，
+#: 所以同一个 uid 的机器画像与设备 id 是两条独立的派生链。
+_CLIENT_PROFILE_SALT = "client-profile"
+
+
+def client_profile_per_account_enabled():
+    """WB_CLIENT_PROFILE_PER_ACCOUNT：默认开，显式 0/false/off/no 才关。"""
+    value = (os.environ.get(CLIENT_PROFILE_ENV) or "").strip().lower()
+    return value not in ("0", "false", "off", "no")
+
+
+def _pick_weighted(value, weights):
+    """把一个字节（0..255）确定性地映射到权重表里的某一项（不用 random）。"""
+    total = sum(weight for _item, weight in weights)
+    point = value * total // 256
+    upto = 0
+    for item, weight in weights:
+        upto += weight
+        if point < upto:
+            return item
+    return weights[-1][0]
+
+
+def _derived_client_profile(uid):
+    """按 uid 稳定派生一份自洽的宿主画像。
+
+    与 wb_fingerprint.derive_id(uid, salt) 同源：同一 uid 每次得到同一个 UUID 形状
+    的派生值，再从它的三处不同字节各取一项（os / arch / node 版本），所以同一
+    账号恒定、不同账号分散，且没有外部数据、没有网络查询，也不用 random——网关
+    重启后同一账号的画像不变（0..47 共 3×2×8 种组合）。
+
+    缺 uid 时与 derive_id 一样落到 "anonymous"，此时所有缺 uid 的账号共用一份
+    画像（与旧行为「共用宿主机值」一致，不会更差）。
+    """
+    seed = wb_fingerprint.derive_id(uid, _CLIENT_PROFILE_SALT).replace("-", "")
+    raw = bytes.fromhex(seed)
+    os_name = _pick_weighted(raw[0], _OS_WEIGHTS)
+    arch = _pick_weighted(raw[1], _ARCH_WEIGHTS[os_name])
+    version = _CLIENT_NODE_VERSIONS[raw[2] % len(_CLIENT_NODE_VERSIONS)]
+    return ClientProfile(os_name, arch, version)
+
+
+def client_profile(uid=None):
+    """这一账号的出站宿主画像 (os, arch, node_version)。
+
+    开关关掉时整份回落到宿主机值（旧行为）；打开时按 uid 派生，但逐项让
+    显式钉住的 OS / arch / Node 版本优先——宿主 OS 与真实 TLS/网络栈一致，
+    有人就是靠它对齐真机的，派生值不该悄悄换掉运维钉住的值。
+
+    三套 UA 都不带 OS/arch 段：官方 buildUserAgent 的 platform 段是**产品名**
+    （WorkBuddy 5.8.4 的 workbuddy-ai、VSCode 扩展的 VSCode、CLI 的 CLI）而不是
+    process.platform，所以 UA 不需要随画像变，也不会出现「UA 说 Windows、头里说
+    MacOS」这种矛盾。若以后哪条 UA 真的要带平台段，取这里同一份画像。
+    """
+    if not client_profile_per_account_enabled():
+        return ClientProfile(_identity_os(), _identity_arch(), _runtime_version())
+    derived = _derived_client_profile(uid)
+    return ClientProfile(_env_identity_os() or derived.os,
+                         _env_identity_arch() or derived.arch,
+                         _pinned_node_version() or derived.node_version)
+
+
 def desktop_chat_compat_enabled():
     """Opt in to desktop chat headers without changing billing or other products."""
     return os.environ.get("WB_DESKTOP_CHAT_COMPAT", "").strip() == "1"
 
 
-def cli_stainless_headers():
-    """官方 OpenAI Node SDK 6.25.0 的 x-stainless-* 指纹头。"""
+def cli_stainless_headers(uid=None):
+    """官方 OpenAI Node SDK 6.25.0 的 x-stainless-* 指纹头。
+
+    uid 给了就走按账号派生的宿主画像（见 client_profile），没给（或开关关掉）
+    就是宿主机值——签名对老调用点保持兼容。
+    """
+    profile = client_profile(uid)
     return {
         "x-stainless-lang": "js",
         "x-stainless-package-version": sdk_version(),
-        "x-stainless-os": _identity_os(),
-        "x-stainless-arch": _identity_arch(),
+        "x-stainless-os": profile.os,
+        "x-stainless-arch": profile.arch,
         "x-stainless-runtime": "node",
-        "x-stainless-runtime-version": (
-            str(_VERSION_OVERRIDES.get("node") or "").strip()
-            or str(os.environ.get("WB_IDENTITY_NODE_VERSION") or "").strip()
-            or node_version()),
+        "x-stainless-runtime-version": profile.node_version,
         "x-stainless-retry-count": "0",
         "x-stainless-timeout": "1200",
     }
@@ -527,9 +657,9 @@ def build_identity_headers(product, realm, uid, token,
         headers.update(trace_headers(with_parent=compat))
         if compat:
             # Desktop profile reported by workbuddy2api-panel's headers.go
-            # (CN 5.8.3 / intl 5.8.4); shared SDK values remain configurable.
+            # (CN 5.8.3 / intl 5.8.4); the host profile follows the account.
             # Not a claim that Python's TLS stack matches the official client.
-            sdk_headers = cli_stainless_headers()
+            sdk_headers = cli_stainless_headers(uid)
             # Desktop request timeout is not verified; do not copy CLI's budget.
             sdk_headers.pop("x-stainless-timeout", None)
             headers.update(sdk_headers)
@@ -615,7 +745,7 @@ def build_identity_headers(product, realm, uid, token,
         # （个人号默认 false、企业号 true），随后策略只在自定义模型/skip 时删头、
         # sticky 会话强制 true。这里按账号是否企业号取对应的默认值。
         headers["X-Private-Data"] = "true" if enterprise_id else "false"
-        headers.update(cli_stainless_headers())
+        headers.update(cli_stainless_headers(uid))
         headers.update(trace_headers(with_parent=True))
 
     # 静态 API Key（ck_/pt_）：官方 CLI 两个头都发（Authorization 与 X-API-Key

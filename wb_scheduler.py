@@ -28,6 +28,26 @@ DAILY_CHAT_BATCH_SLACK = 60
 DAILY_CHAT_ABANDONED_MAX = 8
 
 
+def _env_seconds(name, default):
+    """读一个「秒」环境变量；缺失 / 非法一律回落默认值。"""
+    try:
+        return max(0.0, float(os.environ.get(name) or default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+#: 账号间随机错峰区间（秒），issue #394 的 2~5 秒是原口径。
+#:
+#: 为什么给开关：这个间隔按「一个实例挂多少号」来定才合理。池子上限 3~7 个号
+#: 时 2~5 秒仍可能让几个号在同一次上游判定窗口里被一起看到；而大池子（几十上百
+#: 号）拉长间隔会让一轮巡检跑不完。默认值保持原行为不变，需要更保守时用
+#:   WB_SCHEDULER_STAGGER_MIN=8  WB_SCHEDULER_STAGGER_MAX=25
+#: 这类环境变量调大即可（只对调度器自己的巡检生效）。
+SCHEDULER_STAGGER_MIN = _env_seconds("WB_SCHEDULER_STAGGER_MIN", 2.0)
+SCHEDULER_STAGGER_MAX = max(SCHEDULER_STAGGER_MIN,
+                            _env_seconds("WB_SCHEDULER_STAGGER_MAX", 5.0))
+
+
 def _proxy_module():
     """返回**正在运行的那一份** wb_proxy。
 
@@ -205,11 +225,9 @@ class Scheduler:
                     except Exception as exc:
                         self.log(f"排程执行异常: {exc}")
                     time.sleep(65) # 避开当前这一分钟重复触发
-            # 模型额度窗口探针：不受 enabled 影响。窗口是按首次请求起算的，
-            # 到点没人请求就不会开始新一轮，这件事跟签到/保活开关无关。
+            # 模型额度窗口探针：随调度器开关一起停（见 _run_window_probes）。
             self._run_window_probes()
-            # 模型额度定时主动查询：同样不受 enabled 影响——它是「哪些配额线
-            # 已经打满」的唯一主动信息源，跟签到/保活不是一回事。
+            # 模型额度定时主动查询：同上，关掉调度器就该停止这路自发流量。
             self._run_quota_scans()
             self._stop_event.wait(self._next_wait())
 
@@ -218,7 +236,13 @@ class Scheduler:
 
         一次探针最长可能等上游几十秒，跑在巡检循环里会把整点排程的节奏带偏；
         wb_window_probe 自带防重入锁，重叠启动是无害的。
+
+        调度器被关掉（`enabled=False`）时**不再启动**：探针与额度查询是纯机器
+        节奏的自发出站，运营面板写着「已暂停」而它们还在跑，等于把「暂停」这个
+        动作本身变成了假话——上游看到的流量一点没变（§C 审计 P1）。
         """
+        if not self.enabled:
+            return
         if self._probe_thread and self._probe_thread.is_alive():
             return
         self._probe_thread = threading.Thread(target=self._probe_worker, daemon=True)
@@ -236,7 +260,11 @@ class Scheduler:
 
         一次查询要等上游几十秒，塞进巡检循环会把整点排程的节奏带偏；
         wb_quota_scan 自带防重入锁，重叠启动是无害的。
+
+        与探针一致：调度器关掉就不启动。
         """
+        if not self.enabled:
+            return
         if self._scan_thread and self._scan_thread.is_alive():
             return
         self._scan_thread = threading.Thread(target=self._scan_worker, daemon=True)
@@ -256,6 +284,9 @@ class Scheduler:
         往后推 30 秒，所以这里按最近的窗口到期时间收敛等待。
         """
         wait = 30.0
+        if not self.enabled:
+            # 关掉之后没有探针要抢窗口：别为一个到点的窗口每秒醒一次空转。
+            return wait
         try:
             import wb_window_probe
             accounts_dir = getattr(self.pool, "dir", "") or ""
@@ -383,6 +414,30 @@ class Scheduler:
         finally:
             self._run_lock.release()
 
+    def _blocked_reason(self, acc):
+        """这个账号此刻不该出站的原因；空串 = 可以出站。
+
+        两条判据：账号级上游风控限制（restricted_until，持久化）与区域级连坐
+        暂停（realm 级 hold）。**两处调用**：进入账号 turn 时判一次；每个子任务
+        之前再判一次 —— 限制可能就在本轮前半段落盘（签到撞 403 → note_restricted），
+        而 turn 里后面还有活跃上报 / 猫猫旅行 / 连登管家三条排队要出站。过去它们
+        会接着打，于是 403 之后 1s / 2s / 4s 又各来一个请求，节奏完全可预测
+        （§C 审计 P0-5）。
+        """
+        try:
+            restricted = getattr(acc, "restricted_until", 0.0) or 0.0
+            if restricted > time.time():
+                return "上游风控限制剩余 %ds" % int(restricted - time.time())
+        except (TypeError, ValueError):
+            pass
+        try:
+            hold = _proxy_module().restriction_hold_remaining(acc.realm)
+        except Exception:
+            hold = 0.0
+        if hold > 0:
+            return "%s 区域风控暂停剩余 %ds" % (acc.realm, int(hold))
+        return ""
+
     def _run_cycle(self, trigger_reason="周期巡检", force=False,
                    daily_chat_only=False):
         self.last_run_time = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -414,23 +469,17 @@ class Scheduler:
 
         for idx, acc in enumerate(list(self.pool.accounts)):
             if idx > 0:
-                # 账号间随机错峰防并发风控（2~5秒浮动延时，issue #394）
-                time.sleep(random.uniform(2.0, 5.0))
+                # 账号间随机错峰防并发风控（issue #394；区间可用
+                # WB_SCHEDULER_STAGGER_MIN / _MAX 调整，默认仍是 2~5 秒）
+                time.sleep(random.uniform(SCHEDULER_STAGGER_MIN,
+                                          SCHEDULER_STAGGER_MAX))
             uid8 = acc.uid[:8] if acc.uid else "?"
             # 上游账号级风控限制（403 / code 11140）中的账号一律跳过：无人值守
             # 的巡检/打卡再去「试探」一次，只会让同一台设备上的其他账号连坐。
             # 限制期限是持久化的（wb_accounts.note_restricted），重启后仍然有效。
-            if getattr(acc, "restricted_until", 0.0) > time.time():
-                self.log(f"跳过受限账号 [{uid8}]：上游风控限制剩余 "
-                         f"{int(acc.restricted_until - time.time())}s")
-                continue
-            # 区域级连坐暂停期间（同一窗口内多个账号被限制）整轮都不碰上游。
-            try:
-                hold = _proxy_module().restriction_hold_remaining(acc.realm)
-            except Exception:
-                hold = 0.0
-            if hold > 0:
-                self.log(f"跳过 [{uid8}]：{acc.realm} 区域风控暂停剩余 {int(hold)}s")
+            blocked = self._blocked_reason(acc)
+            if blocked:
+                self.log(f"跳过受限账号 [{uid8}]：{blocked}")
                 continue
             # Task participation is a separate switch from API dispatch: a
             # disabled account can still run check-in / growth / travel /
@@ -467,7 +516,12 @@ class Scheduler:
                             self.log(f"! 账号 [{uid8}] 自动签到未成功: {res.get('error') or res.get('msg')}")
                         time.sleep(1.0)
 
-                    if acc.can_report_activity():
+                    # 签到这一步就可能刚落盘限制（403 → note_restricted），
+                    # 所以每个子任务之前都复查一次，而不是只在 turn 入口判。
+                    blocked = self._blocked_reason(acc)
+                    if blocked:
+                        self.log(f"跳过受限账号 [{uid8}] 的对话活跃上报：{blocked}")
+                    elif acc.can_report_activity():
                         self.log(f"检测到国内版账号 [{uid8}] 今日尚未活跃上报，执行对话活跃上报...")
                         res = acc.report_activity()
                         if res.get("ok"):
@@ -478,27 +532,40 @@ class Scheduler:
                         time.sleep(1.0)
 
                 if run_travel:
-                    # 检查猫猫旅行
-                    tr = do_cat_travel(acc)
-                    if tr.get("action") in ("claim", "depart"):
-                        travel_count += 1
-                        self.log(f"🐱 账号 [{uid8}] 猫猫日常处理: {tr.get('msg')}")
-                    time.sleep(1.0)
-
-                    # 连登管家闭环（补签保连登 -> 礼包/补偿 -> 连登兑换 -> 自动抽奖）
-                    bonus = wb_tasks.run_streak_bonus(acc)
-                    if bonus.get("logs"):
-                        for l in bonus["logs"]:
-                            self.log(f"★ 账号 [{uid8}] {l}")
+                    blocked = self._blocked_reason(acc)
+                    if blocked:
+                        self.log(f"跳过受限账号 [{uid8}] 的猫猫旅行与连登管家：{blocked}")
+                    else:
+                        # 检查猫猫旅行
+                        tr = do_cat_travel(acc)
+                        if tr.get("action") in ("claim", "depart"):
+                            travel_count += 1
+                            self.log(f"🐱 账号 [{uid8}] 猫猫日常处理: {tr.get('msg')}")
                         time.sleep(1.0)
 
+                        # 连登管家闭环（补签保连登 -> 礼包/补偿 -> 连登兑换 -> 自动抽奖）
+                        # 旅行这一步同样可能刚落盘限制，进连登管家前再判一次。
+                        blocked = self._blocked_reason(acc)
+                        if blocked:
+                            self.log(f"跳过受限账号 [{uid8}] 的连登管家：{blocked}")
+                        else:
+                            bonus = wb_tasks.run_streak_bonus(acc)
+                            if bonus.get("logs"):
+                                for l in bonus["logs"]:
+                                    self.log(f"★ 账号 [{uid8}] {l}")
+                                time.sleep(1.0)
+
                 if run_cat:
-                    # 01:00 夜猫子专属任务: black_cat 只在 23:00-08:00 上报计数,
-                    # 之前这个整点只是空转通用巡检, 从未真正上报过夜猫事件。
-                    night = wb_tasks.run_night_growth(acc)
-                    for line in night.get("logs", []):
-                        self.log(f"🌙 {line}")
-                    time.sleep(1.0)
+                    blocked = self._blocked_reason(acc)
+                    if blocked:
+                        self.log(f"跳过受限账号 [{uid8}] 的夜猫子任务：{blocked}")
+                    else:
+                        # 01:00 夜猫子专属任务: black_cat 只在 23:00-08:00 上报计数,
+                        # 之前这个整点只是空转通用巡检, 从未真正上报过夜猫事件。
+                        night = wb_tasks.run_night_growth(acc)
+                        for line in night.get("logs", []):
+                            self.log(f"🌙 {line}")
+                        time.sleep(1.0)
 
             # 3. 如果是国际版账号，检查每日活跃对话 (送 30/50 积分福利)
             if acc.realm == "intl" and task_active and run_daily_chat:

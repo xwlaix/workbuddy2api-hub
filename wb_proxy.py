@@ -10240,7 +10240,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.8.0",
+        "version": "1.8.4",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -10858,6 +10858,106 @@ def merge_reasoning(base, live):
         out.setdefault("defaultEffort", out["effort"])
         out.pop("effort", None)
     return out
+
+
+# --- 出站档位口径：只认「上游自己声明」的那一份 -----------------------------
+# 面板展示与出站放行必须是两条口径。展示用上面 merge_reasoning() 的合并块：
+# 内置快照会补上 live 没写的 supportedEfforts，档位控件才有东西可选。但把「快照
+# 补出来的档位」当成放行依据，就会出现客户端选 max、上游其实只声明 high 的请求被
+# 原样发出去——上游不认这个档位时整条请求 400 / code 11-128（#557）。
+#
+# 所以在组装目录时顺手记下**上游自己声明的那一份**（不做任何补值），出站校验只
+# 读这一份。静态表继续服务面板与提示，不再充当放行依据。
+#   WB_REASONING_EFFORT_LIVE_ONLY=0 回到旧口径（合并块即放行依据）。
+_live_reasoning = {}          # realm -> {"at": ts, "models": {mid: reasoning block}}
+
+
+def note_live_reasoning(realm, live):
+    """Record the reasoning block the upstream itself declared, per realm.
+
+    Called right where the catalogue is built, so the outbound side reads the
+    same snapshot the catalogue came from. Only entries that carry real
+    metadata are recorded: the narrow endpoint answers with bare names, and
+    "we were told nothing" must not be mistaken for "the upstream declared
+    nothing".
+    """
+    models = {}
+    detailed = 0
+    for mid, meta in live or []:
+        if not isinstance(meta, dict) or not meta or not mid:
+            continue
+        detailed += 1
+        block = meta.get("reasoning")
+        models[str(mid).strip().lower()] = dict(block) if isinstance(block, dict) and block else {}
+    if not detailed:
+        # 这次没有可用目录（bundled 兜底 / 窄接口）：保留上一次已知的 live 口径，
+        # 不要把「不知道」写成「什么都不声明」。
+        return
+    with _lock:
+        _live_reasoning[realm] = {"at": time.time(), "models": models}
+
+
+def live_reasoning_meta(model):
+    """The reasoning block the upstream declared for `model`, or None.
+
+    None means the row is unknown: no live catalogue has been recorded at all
+    (bundled-only install, cold cache, narrow endpoint). Callers then fall back
+    to the old static-based rule instead of forcing every model to its default.
+    {} means the live catalogue *is* known and declares no reasoning block for
+    this model - nothing may be released on its behalf.
+
+    Realm handling: `detect_model_realm` is a coarse hint (it answers
+    CURRENT_REALM for anything not on its two short lists), so a miss there is
+    not taken as "not declared": when exactly one recorded realm knows the
+    model, that realm's block is used. Two realms disagreeing - or the model
+    simply being absent everywhere - yields {}, i.e. the fallback default,
+    never an invented level.
+    """
+    if not model:
+        return None
+    try:
+        realm = detect_model_realm(model) or CURRENT_REALM
+    except Exception:
+        realm = None
+    if not _live_reasoning:
+        return None
+    key = str(model).strip().lower()
+    snap = _live_reasoning.get(realm) if realm else None
+    if isinstance(snap, dict):
+        block = (snap.get("models") or {}).get(key)
+        if isinstance(block, dict):
+            return dict(block)
+    hits = []
+    for other in _live_reasoning.values():
+        if not isinstance(other, dict):
+            continue
+        block = (other.get("models") or {}).get(key)
+        if isinstance(block, dict):
+            hits.append(dict(block))
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        # 两个区域的口径不一致：不拿它当放行依据（走默认档最安全）。
+        return {}
+    if isinstance(snap, dict):
+        # 该区域已知，只是目录里没有这个模型。
+        return {}
+    return None
+
+
+def reasoning_effort_live_only():
+    """Whether an effort is released only when the upstream declared it.
+
+    Safety default, not a feature change: the failure this prevents (an
+    undeclared level -> 400 / code 11-128, whole request lost) is strictly worse
+    than running at the model's default level. WB_REASONING_EFFORT_LIVE_ONLY=0
+    restores the previous behaviour, where the merged (snapshot-filled) block
+    decided what may be released.
+    """
+    raw = os.environ.get("WB_REASONING_EFFORT_LIVE_ONLY", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off", "disabled")
+
+
 def merge_catalog(primary, realm=None, extras=False):
     r = realm or CURRENT_REALM
     merged = {}
@@ -11004,6 +11104,7 @@ def fetch_models(realm=None):
             if live:
                 source = "endpoint"
         entries = merge_catalog(live, realm=r, extras=extras)
+        note_live_reasoning(r, live)
         note_bundled_reasoning(r, live, entries)
         if not live:
             # 没有任何活数据：清单完全来自内置快照（硬编码兜底）。
@@ -11023,6 +11124,60 @@ def fetch_models(realm=None):
             _catalog_meta[r] = {"source": source, "fetched_at": time.time(),
                                 "file_mtime": file_mtime}
         return entries
+# --- 对外声明的档位：与「会被放行」的档位同源（§D5）--------------------------
+# 出站放行已经只认上游自己声明的那一份（_enforce_live_effort，
+# WB_REASONING_EFFORT_LIVE_ONLY=1），但 /v1/models 过去广告的是**合并块**：内置
+# 快照会给 live 没写 supportedEfforts 的模型补上 low/high/max。于是客户端能选
+# max、实际跑 high——一个用户看不见的行为差异（磁盘上的用量行还会写 max）。
+#
+# 现在对外声明与放行同源：live 声明几档就广告几档；live 只声明一个 bare effort
+# 就只广告那一档；live 还没建立（冷启动 / 纯内置快照 / 窄接口）就一档都不广告。
+# 静态表继续服务面板与推测值，但不再进入对外声明。
+#   WB_MODELS_EFFORT_LIVE_ONLY=0 回到「合并块即声明」的旧口径。
+#   不设时跟随 WB_REASONING_EFFORT_LIVE_ONLY（默认 1）——声明与放行不该各说各话。
+def models_effort_live_only():
+    raw = os.environ.get("WB_MODELS_EFFORT_LIVE_ONLY")
+    if raw is None or not str(raw).strip():
+        return reasoning_effort_live_only()
+    return str(raw).strip().lower() not in ("0", "false", "no", "off", "disabled")
+
+
+def advertised_reasoning(model, merged=None):
+    """这一次 /v1/models 可以宣告的档位块。
+
+    形状与 catalog 的 reasoning 块一致（supportedEfforts / effort / defaultEffort /
+    canDisableThinking），空 dict 表示「什么都不声明」——客户端因此不会给出档位
+    选择器，也就不会选中一个上游不认的档位。
+    """
+    if not models_effort_live_only():
+        return dict(merged if merged is not None else model_reasoning_meta(model) or {})
+    live = live_reasoning_meta(model)
+    if not isinstance(live, dict):
+        # None = 还没有任何 live 目录（冷启动窗口 / 窄接口 / 纯内置快照）：
+        # 宁可什么都不说，也不要拿静态表广告一个上游可能不认的档位。
+        # 预热见 start_catalog_prewarm()。
+        return {}
+    out = {}
+    levels = _effort_levels(live)
+    fixed = live.get("effort")
+    fixed = fixed.strip() if isinstance(fixed, str) and fixed.strip() else ""
+    if levels:
+        out["supportedEfforts"] = levels
+    elif fixed:
+        # 上游只声明一个固定档：就广告这一档（"只有它"，而不是"不可选"）。
+        out["supportedEfforts"] = [fixed]
+        out["effort"] = fixed
+    else:
+        # live 明确知道这个模型、但没声明任何档位：什么都不广告。
+        return {}
+    default = _declared_effort_default(live, {})
+    if default:
+        out.setdefault("defaultEffort", default)
+    if live.get("canDisableThinking") is not None:
+        out["canDisableThinking"] = live.get("canDisableThinking")
+    return out
+
+
 def model_entry(mid, meta):
     """Build a rich /v1/models entry from the desktop app catalog metadata.
     The OpenAI spec only names id/object/created/owned_by, so capability data is
@@ -11111,7 +11266,9 @@ def model_entry(mid, meta):
     if ctx:
         item["context_windows"] = ctx
     # ---- reasoning controls ----
-    reasoning = meta.get("reasoning") or {}
+    # §D5：对外声明取 advertised_reasoning()（与放行同源），不再直接用合并块。
+    # 默认口径下 merged 只在开关关掉时才被采用。
+    reasoning = advertised_reasoning(mid, meta.get("reasoning") or {})
     efforts = reasoning.get("supportedEfforts")
     if efforts:
         item["reasoning_efforts"] = efforts
@@ -11448,6 +11605,7 @@ def refresh_catalog(realm):
         live = [(mid, meta.get(mid) or {})
                 for mid in curate_remote_catalog(realm, ids, meta)]
         entries = merge_catalog(live, realm=realm, extras=True)
+        note_live_reasoning(realm, live)
         note_bundled_reasoning(realm, live, entries)
         with _lock:
             _models_cache[realm] = {"at": time.time(), "data": entries}
@@ -11516,6 +11674,49 @@ def catalog_daily_loop():
 def start_catalog_daily():
     threading.Thread(target=catalog_daily_loop, name="catalog-daily",
                      daemon=True).start()
+
+
+def catalog_prewarm_enabled():
+    """是否在进程启动时主动构建一次目录（默认开）。"""
+    raw = os.environ.get("WB_CATALOG_PREWARM", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off", "disabled")
+
+
+def start_catalog_prewarm(pool=None):
+    """启动预热：进程一起来就把池里每个 realm 的目录构建一次。
+
+    为什么需要（§D5 冷启动窗口）：/v1/models 的档位声明现在只读 live 口径
+    （见 advertised_reasoning），而 `_live_reasoning` 只在构建目录时才被填。
+    `catalog_daily_loop` 要先睡 60 秒，加上「还没人请求过 /v1/models」，这段时间
+    live 口径是空的——窗口内一档都不广告（这是刻意的兜底），但客户端在这几十秒
+    里看不到档位选择器。预热把这个窗口压到进程起来的一两秒，与「窗口内不广告
+    静态档位」互为兜底：离线部署时预热会读本机桌面缓存文件，读不到就按"没有
+    声明"处理，仍然不会广告静态三档。
+    """
+    if not catalog_prewarm_enabled():
+        return None
+
+    def worker():
+        realms = []
+        try:
+            for account in getattr(pool, "accounts", ()) or ():
+                realm = str(getattr(account, "realm", "") or "")
+                if realm and realm not in realms and getattr(account, "enabled", False):
+                    realms.append(realm)
+        except Exception:
+            realms = []
+        if not realms:
+            realms = [CURRENT_REALM]
+        for realm in realms:
+            try:
+                entries = fetch_models(realm=realm)
+                log("catalog prewarm: %s ready (%d models)" % (realm, len(entries)))
+            except Exception as exc:
+                log("catalog prewarm: %s failed (%s)" % (realm, exc))
+
+    thread = threading.Thread(target=worker, name="catalog-prewarm", daemon=True)
+    thread.start()
+    return thread
 
 
 def product_config_path(realm):
@@ -11932,6 +12133,98 @@ def preserve_request_contract_enabled():
         "1", "true", "yes", "on")
 
 
+def has_identity_fingerprint(text):
+    """Whether text carries one of the identity / brand phrases we rewrite.
+
+    A narrower sibling of has_fingerprint(): only the identity rules count, so
+    a caller that must not disturb formatting (sanitize_identity_only) skips
+    cheaply on text that merely holds a generic fingerprint.
+    """
+    if not isinstance(text, str) or not text:
+        return False
+    if "\u0130" in text or "\u0131" in text or "\u017f" in text:
+        low = text.translate(SANITIZE_REI_FOLD).lower()
+    else:
+        low = text.lower()
+    if (SANITIZE_BRAND_LOWER in low
+            and SANITIZE_BRAND_RE.search(text) is not None):
+        return True
+    if (SANITIZE_DSH_GUI_LOWER in low
+            and SANITIZE_DSH_GUI_RE.search(text) is not None):
+        return True
+    if not any(needle in low for needle in SANITIZE_IDENTITY_LOWER):
+        return False
+    return SANITIZE_IDENTITY_RE.search(text) is not None
+
+
+def sanitize_identity_only(text):
+    """Rewrite identity / brand phrases and touch nothing else.
+
+    sanitize_text() also strips the ends and removes `cc_*` / billing-header
+    fragments. That is harmless in prose, but application data (tool-call
+    arguments) has to survive byte-for-byte apart from the fingerprint itself -
+    a stripped space can change the payload a file-editing tool receives - so
+    this variant skips every step that could alter formatting.
+    """
+    if not has_identity_fingerprint(text):
+        return text
+    text = SANITIZE_IDENTITY_RE.sub(SANITIZE_IDENTITY_REPLACEMENT, text)
+    text = SANITIZE_DSH_GUI_RE.sub(SANITIZE_DSH_GUI_REPLACEMENT, text)
+    return SANITIZE_BRAND_RE.sub(SANITIZE_BRAND_REPLACEMENT, text)
+
+
+def tool_argument_sanitize_enabled():
+    """Whether identity phrases inside tool-call arguments are rewritten.
+
+    On by default: an assistant turn that quoted the system prompt inside its
+    arguments carries the same 11-128 fingerprint as one that quoted it in
+    prose (#574). WB_SANITIZE_TOOL_ARGUMENTS=0 restores the previous behaviour
+    (arguments only got the generic fingerprint pass).
+    """
+    raw = os.environ.get("WB_SANITIZE_TOOL_ARGUMENTS", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off", "disabled")
+
+
+def _sanitize_json_strings(node):
+    """Walk a parsed JSON tree and rewrite only its string leaves."""
+    if isinstance(node, str):
+        return sanitize_identity_only(node)
+    if isinstance(node, list):
+        return [_sanitize_json_strings(item) for item in node]
+    if isinstance(node, dict):
+        return dict((key, _sanitize_json_strings(value))
+                    for key, value in node.items())
+    return node
+
+
+def sanitize_tool_arguments(raw):
+    """Scrub identity phrases inside a JSON tool-argument string.
+
+    The string must stay valid JSON: a broken `arguments` value loses the whole
+    tool call, which is far worse than the fingerprint it carried. So it is
+    parsed, walked, and re-serialized only when a string leaf actually changed.
+    Anything unparsable passes through untouched with one log line - never a
+    best-effort text edit.
+    """
+    if not isinstance(raw, str) or not raw or not tool_argument_sanitize_enabled():
+        return raw
+    if not has_identity_fingerprint(raw):
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        log("tool arguments: identity scrub skipped (not valid JSON)")
+        return raw
+    fixed = _sanitize_json_strings(parsed)
+    if fixed == parsed:
+        return raw
+    try:
+        return json.dumps(fixed, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        log("tool arguments: identity scrub skipped (re-serialize failed)")
+        return raw
+
+
 def sanitize_tool_calls(tool_calls):
     if not isinstance(tool_calls, list):
         return tool_calls
@@ -11949,8 +12242,14 @@ def sanitize_tool_calls(tool_calls):
                 fn = dict(fn)
                 raw_args = fn.get("arguments")
                 if isinstance(raw_args, str):
-                    fn["arguments"] = (raw_args if preserve
-                                       else sanitize_text(raw_args, identity=False))
+                    if preserve:
+                        fn["arguments"] = raw_args
+                    else:
+                        # 既有清洗（`cc_*` / billing 头）保持原样，随后只针对
+                        # 身份句做一次 JSON 感知的改写：解析→改字符串叶子→
+                        # 重新序列化，解析不了就原样放行（见 sanitize_tool_arguments）。
+                        cleaned = sanitize_text(raw_args, identity=False)
+                        fn["arguments"] = sanitize_tool_arguments(cleaned)
                 elif raw_args is None:
                     fn["arguments"] = "{}"
                 else:
@@ -11981,8 +12280,11 @@ def sanitize_messages(messages):
                 item["content"] = sanitize_content(item["content"],
                                                    identity=identity)
             if isinstance(item.get("reasoning_content"), str):
+                # 推理轨迹是模型自己产出的文本（不是用户数据），而且极常复述
+                # system 提示的首句身份句；客户端回灌上一轮轨迹时，这句话就换
+                # 了个位置重新出站，仍是同一套 11-128 指纹（#574）。
                 item["reasoning_content"] = sanitize_text(
-                    item["reasoning_content"], identity=False)
+                    item["reasoning_content"], identity=identity)
             if "tool_calls" in item:
                 item["tool_calls"] = sanitize_tool_calls(item["tool_calls"])
             out.append(item)
@@ -13158,34 +13460,79 @@ def client_effort_of(body):
 def upstream_effort_of(body, model=None):
     """The reasoning effort a request actually runs at, or None when unknown.
 
-    Resolved the way the upstream will apply it:
+    记账口径 = **真正会跑的那一档**（§D5-2）。传进来的 `body` 是**出站 body**，
+    它已经过 map_reasoning_effort / _enforce_live_effort 收敛：客户端发 max、上游
+    只声明 high 时，body 里已经是 high。所以先读 body，再回落到目录知识——旧实现
+    顺序相反（先拿目录的固定档覆盖），于是出现过「声明只有 high、客户端硬发 max、
+    用量行记 max」的静默差异。
 
-      - a model the catalog pins to one level (reasoning.effort, no
-        supportedEfforts) always runs there: the picker offers no choice for it,
-        so a value the request carries anyway does not change the answer;
-      - a request that switched thinking off, or asked for "none", ran without
-        reasoning and nothing below overrides that;
-      - otherwise the client's own value wins, under either spelling;
-      - otherwise the model's declared defaultEffort applies.
+    判定顺序：
+      1. thinking.type=disabled，或请求值是 none ⇒ "none"（关掉思考是答案，不被
+         默认档填回来）；
+      2. body 里带着 effort（两种拼写都认）⇒ 那就是生效值；
+      3. body 里什么都没有 ⇒ 上游会用它自己的默认档：
+         * live 口径已知且声明过档位/固定档 ⇒ live 的默认档（_declared_effort_default，
+           与收敛侧同一个函数，所以两边不可能各说各话）；
+         * live 已知但这个模型没声明任何档位 ⇒ None（上游用自己的默认，我们不知道，
+           不拿合并块的静态值去猜——那正是静默差异的来源）；
+         * live 完全未知（纯内置快照 / 窄接口）⇒ 退回合并块的固定档与默认档（旧口径）。
 
-    Reading the body alone is not enough for the last two: the gateway only
-    writes an effort into the body for the models it injects for, so a plain
-    request to a pinned model would otherwise be reported as "no effort".
+    Reading the body alone is not enough for step 3: the gateway only writes an
+    effort into the body for the models it injects for, so a plain request to a
+    pinned model would otherwise be reported as "no effort".
     """
-    given = client_effort_of(body)
-    if model:
-        fixed = model_fixed_effort(model)
-        if fixed:
-            return fixed
-    thinking = (body or {}).get("thinking") if isinstance(body, dict) else None
+    if not isinstance(body, dict):
+        body = {}
+    thinking = body.get("thinking")
     if isinstance(thinking, dict) and \
             str(thinking.get("type") or "").strip().lower() == "disabled":
         return "none"
-    if str(given or "").strip().lower() == "none":
-        return "none"
-    if given:
-        return given
-    return model_default_effort(model) if model else None
+    given = client_effort_of(body)
+    if given is not None and str(given).strip():
+        value = str(given).strip()
+        return "none" if value.lower() == "none" else value
+    if not model:
+        return None
+    # 与放行侧同一个开关：WB_REASONING_EFFORT_LIVE_ONLY=0 时放行退回合并块，
+    # 记账也必须一起退回，否则又变成「声明/放行一套、记账另一套」。
+    live = live_reasoning_meta(model) if reasoning_effort_live_only() else None
+    if isinstance(live, dict):
+        if live.get("effort") or _effort_levels(live):
+            return _declared_effort_default(live, {})
+        return None
+    fixed = model_fixed_effort(model)
+    if fixed:
+        return fixed
+    return model_default_effort(model)
+
+
+_effort_divergence_seen = set()
+
+
+def note_effort_divergence(payload, model, effective):
+    """请求档位与生效档位不一致时记一条（同一组合只记一次）。
+
+    用量行按「实际跑的档位」记账（见 upstream_effort_of）。usage 行是固定 schema
+    （`record_usage()` 逐字段构造，面板与聚合都按现有列读），不在那里加字段；
+    两者都看得见这件事交给日志：map_reasoning_effort 已经会打 `effort: x -> y`，
+    这里再补一条把「客户端请求值」明确写出来，排障时不必回看请求体。
+    """
+    try:
+        requested = client_effort_of(payload)
+    except Exception:
+        requested = None
+    if not requested or not effective:
+        return
+    if str(requested).strip().lower() == str(effective).strip().lower():
+        return
+    signature = (str(model or ""), str(requested), str(effective))
+    if signature in _effort_divergence_seen:
+        return
+    if len(_effort_divergence_seen) > 128:
+        _effort_divergence_seen.clear()
+    _effort_divergence_seen.add(signature)
+    log("effort: '%s' requested %r but runs at %r (usage row records %r)"
+        % (model or "-", requested, effective, effective))
 
 
 def background_request_message(reason):
@@ -13265,6 +13612,117 @@ def apply_prompt_mode(messages):
     return messages
 
 
+# --- 出站 chat body 的字段白名单（§D3）---------------------------------------
+# /v1/chat/completions 过去是 `body = dict(payload)` **整包透传**：客户端的
+# metadata / user / client_metadata / store / service_tier / thinking 全都会跟着
+# 出站。这些字段上游要么根本不绑定（Go struct 直接忽略），要么是我们不想替客户
+# 端背的语义（store / service_tier 是 OpenAI 的持久化与路由档位），而 user 更是
+# 客户端自己塞的终端用户标识——网关用一个出口冒充几十台设备时，它反而成了把请求
+# 串起来的线索。
+#
+# 口径与同仓 responses_to_chat() 一致：**只重建官方客户端真的会发的字段**，未知
+# 字段丢弃并记一条日志（同一组字段只记一次，便于对拍/排障，不静默吞）。
+#   WB_CHAT_BODY_WHITELIST=0 回到整包透传（默认 1）。
+CHAT_BODY_FIELDS = frozenset((
+    # 协议核心
+    "model", "messages", "stream", "stream_options",
+    # 采样与长度
+    "max_tokens", "max_completion_tokens", "temperature", "top_p", "stop",
+    "seed", "n", "presence_penalty", "frequency_penalty", "logit_bias",
+    "logprobs", "top_logprobs",
+    # 工具与结构化输出
+    "tools", "tool_choice", "parallel_tool_calls", "response_format",
+    # 旧的根级函数声明：normalize_tools() 会把它改写成 tools，所以必须放行
+    "functions",
+    # 思考档位（上游协议字段；thinking 的子键下面只留 type）
+    "reasoning_effort", "reasoningEffort", "thinking",
+))
+
+#: 明确**不**出站的字段（写在这里是为了让"为什么没有它"可读，而不是靠猜）。
+#:
+#: `user`：**故意丢，别加回来**（§D3 复核结论）。OpenAI 的 `user` 是客户端自己
+#: 设的终端用户标识，上游并不需要它；而这台网关是用一个出口冒充多台设备，同一
+#: 个 `user` 值跟着不同账号出站，正好成了把多个账号串起来的关联键。真要为某个
+#: 客户端恢复它，改的应该是那个客户端（别传），不是这里放宽白名单。
+#:
+#: 嵌套 `reasoning: {effort: ...}`：**故意不收，别以为漏了**。chat 路径只认
+#: `reasoning_effort` / `reasoningEffort`（build_upstream_body 与 client_effort_of
+#: 都只读这两个；Responses 路径下的 `reasoning.effort` 由 responses_to_chat() 在
+#: 进入本函数之前就翻译掉了）。要让 chat 路径也认嵌套写法，得同时改
+#: build_upstream_body 与 _enforce_live_effort，否则只放行不翻译等于把未知形状
+#: 丢给上游。
+CHAT_BODY_DROPPED_BY_DESIGN = frozenset((
+    "metadata", "client_metadata",   # 客户端内部元数据，上游不读
+    "user",                          # 故意丢：终端用户标识＝跨账号关联键
+    "store", "service_tier",         # OpenAI 的持久化 / 路由档位语义
+    "prompt_cache_key",              # 由网关按账号派生（inject_prompt_cache_key）
+))
+
+_chat_body_dropped_seen = set()
+
+
+def chat_body_whitelist_enabled():
+    """出站 chat body 是否走白名单重建（默认开）。"""
+    raw = os.environ.get("WB_CHAT_BODY_WHITELIST", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off", "disabled")
+
+
+def _normalize_thinking_field(value):
+    """把 thinking 收敛成上游真正会读的 `{"type": ...}`。
+
+    返回 (新值, 被丢掉的子键名列表)；新值为 None 表示这个字段整体不该出站。
+    上游只按 type 决定开/关思考（网关自己也只注入 `{"type": "enabled"}`），
+    客户端带来的 display / budget_tokens 之类没有语义，跟着出站只是多一处指纹。
+    """
+    if not isinstance(value, dict):
+        return None, ["thinking"]
+    kind = str(value.get("type") or "").strip()
+    extra = sorted(str(k) for k in value if str(k) != "type")
+    if not kind:
+        return None, extra + ["thinking.type"]
+    return {"type": kind}, extra
+
+
+def _note_dropped_chat_fields(names):
+    """同一条「这组字段被丢掉了」只打一次日志（热路径上不刷屏）。"""
+    signature = tuple(sorted(set(names)))
+    if not signature or signature in _chat_body_dropped_seen:
+        return
+    if len(_chat_body_dropped_seen) > 64:
+        _chat_body_dropped_seen.clear()
+    _chat_body_dropped_seen.add(signature)
+    log("chat body: dropped %d field(s) not on the outbound whitelist: %s"
+        % (len(signature), ", ".join(signature)))
+
+
+def _whitelisted_chat_body(payload):
+    """按白名单重建出站 chat body（见 CHAT_BODY_FIELDS）。"""
+    if not chat_body_whitelist_enabled():
+        return dict(payload)
+    body = {}
+    dropped = []
+    for key, value in payload.items():
+        name = str(key)
+        if name.startswith("_"):
+            # 网关内部标记（namespace map / web tools flag…）：本来就不出站，
+            # 由 build_upstream_body 自己的 `_` 规则处理，不当作"客户端字段"记账。
+            continue
+        if name not in CHAT_BODY_FIELDS:
+            dropped.append(name)
+            continue
+        body[key] = value
+    if "thinking" in body:
+        normalized, extra = _normalize_thinking_field(body["thinking"])
+        if normalized is None:
+            body.pop("thinking", None)
+            dropped.append("thinking")
+        else:
+            body["thinking"] = normalized
+            dropped.extend("thinking.%s" % name for name in extra)
+    _note_dropped_chat_fields(dropped)
+    return body
+
+
 def build_upstream_body(payload):
     model = payload.get("model") or ""
     # Map an unsupported level before anything below reads the effort, so the
@@ -13294,14 +13752,11 @@ def build_upstream_body(payload):
     )
     if not messages or (messages[0].get("role") != "system"):
         messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
-    body = dict(payload)
-    # Private request markers ride along on the chat body for the Responses
-    # path (the namespace map, the local-web-tools flag). They are not part of
-    # the upstream protocol, so drop them here rather than trusting the
-    # upstream to ignore unknown keys.
-    for _marker in [k for k in body if str(k).startswith("_")]:
-        body.pop(_marker, None)
-    # dict(payload) 会把原始模型名一起带过去，所以别名要在这里覆盖回去
+    # §D3：不再整包透传，按白名单重建（见 CHAT_BODY_FIELDS）。这一步同时把
+    # 网关私有标记（`_` 前缀，只给 Responses 路径用）挡在出站之外——过去是
+    # 先 dict(payload) 再逐个 pop，现在只挑认识的字段进来。
+    body = _whitelisted_chat_body(payload)
+    # 白名单会把原始模型名一起带过来，所以别名要在这里覆盖回去
     body["model"] = model
     body["messages"] = messages
     # Repair tool-call pairing before the body leaves: a call whose result never
@@ -13356,6 +13811,11 @@ def build_upstream_body(payload):
                         chosen = "high"
                     if chosen:
                         body["reasoning_effort"] = chosen
+    # The level injected just above comes from the catalogue, which the bundled
+    # snapshot also feeds (defaultEffort), so it has to clear the same bar as a
+    # client-supplied level: run the outbound check once more. Idempotent - an
+    # already-legal level is returned untouched (#557).
+    body = map_reasoning_effort(body, model)
     body["stream"] = True
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
@@ -13452,22 +13912,125 @@ def _fallback_effort(reasoning):
     return None
 
 
+def _effort_levels(reasoning):
+    """The level list one reasoning block declares, normalized for comparison."""
+    return [str(level).strip()
+            for level in (reasoning.get("supportedEfforts") or [])
+            if str(level).strip()]
+
+
+def _declared_effort_default(live, static):
+    """The level to fall back to, preferring what the upstream declared.
+
+    A default is only ever a value the model already runs at, so taking it from
+    the bundled table (when the live block carries none) can never release a
+    level the upstream does not know - unlike `supportedEfforts`, which is the
+    list of *options* and must therefore come from the live block only.
+    """
+    for block in (live, static):
+        if not isinstance(block, dict):
+            continue
+        default = block.get("defaultEffort")
+        if isinstance(default, str) and default.strip():
+            return default.strip()
+        fixed = block.get("effort")
+        if isinstance(fixed, str) and fixed.strip():
+            return fixed.strip()
+        levels = _effort_levels(block)
+        if levels:
+            return levels[0]
+    return None
+
+
+def _enforce_live_effort(body, key, raw, model):
+    """Release only a level the upstream declared; otherwise use its default.
+
+    Returns the body, or None when there is no live knowledge for this realm at
+    all (the caller then uses the legacy rule). `live == {}` means "the upstream
+    declared no reasoning controls for this model", so no requested level may
+    ride along - not even one the bundled table happens to list (#557).
+    """
+    live = live_reasoning_meta(model)
+    if live is None:
+        return None
+    static = model_reasoning_meta(model) or {}
+    levels = _effort_levels(live)
+    fixed = live.get("effort")
+    fixed = fixed.strip() if isinstance(fixed, str) and fixed.strip() else ""
+    default = _declared_effort_default(live, static)
+
+    if not isinstance(raw, str):
+        # The upstream field is a level name; numbers/booleans/objects are not
+        # levels at all, so they cannot be released either.
+        requested = ""
+        replacement = default
+    else:
+        requested = raw.strip()
+        if not requested:
+            replacement = default
+        elif _thinking_off_value(requested):
+            # "none" is not a level: it is the client switching reasoning off.
+            # Kept unless the upstream says the model cannot disable thinking.
+            if live.get("canDisableThinking") is not False:
+                return body
+            replacement = default
+        elif levels:
+            if any(level.lower() == requested.lower() for level in levels):
+                return body
+            replacement = default
+        elif fixed:
+            if fixed.lower() == requested.lower():
+                return body
+            replacement = default
+        else:
+            # The upstream declared no reasoning controls for this model at
+            # all: there is no level to converge to either, so the field goes
+            # away. Silently dropping it is what an official client that never
+            # sends the field looks like.
+            if key in body:
+                body.pop(key, None)
+                log("effort: %s %r dropped (upstream declared no level)"
+                    % (model, raw))
+            return body
+
+    if replacement and replacement != raw:
+        body[key] = replacement
+        log("effort: %s %r -> %r (upstream declared %s)" % (
+            model, raw, replacement,
+            ",".join(levels) if levels else (fixed or "no level")))
+    elif not replacement and key in body:
+        body.pop(key, None)
+        log("effort: %s %r dropped (upstream declared no level)" % (model, raw))
+    return body
+
+
 def map_reasoning_effort(body, model):
     """Rewrite an effort the model does not accept to its default level.
 
     A client with a fixed level picker (low/medium/high) keeps sending levels
     a model does not declare; the upstream then rejects the whole request
-    instead of picking one. When the catalog knows the model's levels, an
-    unsupported value is replaced with the model's default; a request that
-    disables thinking is only kept when the model allows disabling it.
+    instead of picking one. An unsupported value is replaced with the model's
+    default; a request that disables thinking is only kept when the model
+    allows disabling it.
 
-    Off via the reasoning_effort_map setting. Only the value changes: the key
-    keeps its original spelling and every other field is left alone.
+    Two pass criteria share this function:
+
+      * outbound default (WB_REASONING_EFFORT_LIVE_ONLY=1): only a level the
+        *upstream* declared may be released; when it declared no levels the
+        request converges to the model's default (see _enforce_live_effort);
+      * legacy: the merged catalogue decides, which lets the bundled snapshot
+        invent levels the upstream never declared (#557). Used only when no
+        live catalogue is known, or when the switch above is turned off.
+
+    Off via the reasoning_effort_map setting. Only the value changes (plus the
+    camelCase key spelling, which the upstream Go struct does not bind): every
+    other field is left alone.
     """
     if not isinstance(body, dict) or not model:
         return body
     if not wb_settings.reasoning_effort_map(ACCOUNTS_DIR):
         return body
+    live_only = reasoning_effort_live_only()
     key = None
     for candidate in ("reasoning_effort", "reasoningEffort"):
         if candidate in body:
@@ -13475,7 +14038,18 @@ def map_reasoning_effort(body, model):
             break
     if key is None:
         return body
+    if live_only and key == "reasoningEffort" and live_reasoning_meta(model) is not None:
+        # The upstream Go struct only binds snake_case, so a camelCase effort is
+        # a field it never reads: the level silently does nothing. Renamed only
+        # when the live catalogue is known - the legacy path keeps the spelling
+        # the client sent.
+        body["reasoning_effort"] = body.pop("reasoningEffort")
+        key = "reasoning_effort"
     raw = body.get(key)
+    if live_only:
+        enforced = _enforce_live_effort(body, key, raw, model)
+        if enforced is not None:
+            return enforced
     if not isinstance(raw, str):
         return body
     requested = raw.strip()
@@ -14450,6 +15024,35 @@ def _free_model_credit_fallback_enabled():
         "1", "true", "yes", "on")
 
 
+# --- 换号重试之间的抖动间隔 ------------------------------------------------
+# 429 / 402 / 401 / 5xx 这几条分支过去都是「记一笔、立刻 continue」，于是同一个
+# 客户端请求里的同一份 body 会在同一秒内落到池里的下一个账号上。上游把「同一个
+# 出口 IP 上、同一秒内、两个不同账号收到同一份请求」当作账号关联的证据（社区
+# 复盘 #629 / #664 的口径：最强的信号不是请求特征，而是账号之间的关联性），
+# 而「同秒」完全是网关自己的重试节奏造成的，客户端并没有要求这么快。
+#
+# 所以换号前先睡一段带抖动的短延迟：既跨过秒边界，也让并发请求算不到同一个
+# 时刻（固定值会让所有并发失败请求在同一毫秒一起重发，那正是同秒突发的另一半）。
+#
+# 区间按「客户端还能等」取：这几条分支本来就要重试，单次 0.8~2.5 秒可接受；
+# 池里只有一个可用账号时（total <= 1）换号换不出去，一律不睡——那种情况只会
+# 触发整池重轮，白等纯属拖长客户端延迟。
+#   WB_RETRY_ROTATE_DELAY_MIN / _MAX 可调（秒）；两个都设 0 即关闭这段延迟。
+RETRY_ROTATE_DELAY_MIN = _env_number("WB_RETRY_ROTATE_DELAY_MIN", 0.8)
+RETRY_ROTATE_DELAY_MAX = max(RETRY_ROTATE_DELAY_MIN,
+                             _env_number("WB_RETRY_ROTATE_DELAY_MAX", 2.5))
+
+
+def rotation_delay():
+    """这一次换号重试前该睡多久（秒）；0 表示不睡。
+
+    单独抽成函数：测试可以把它替换成 0，避免每次换号用例都真睡 1~2 秒。
+    """
+    if RETRY_ROTATE_DELAY_MAX <= 0:
+        return 0.0
+    return random.uniform(RETRY_ROTATE_DELAY_MIN, RETRY_ROTATE_DELAY_MAX)
+
+
 def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=None,
                   allow_credit_fallback=True, allow_product_switch=True,
                   pin_account=None, defer_egress_success=False,
@@ -14507,11 +15110,10 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         if session_key and AFFINITY_DEBUG:
             log("affinity: derived %s for %d msgs"
                 % (session_key, len(upstream_body.get("messages") or [])))
-    # 一轮 user send 的 request id：官方 CLI 在这一轮的所有请求（含重试/换号）
-    # 复用同一个 X-Conversation-Request-ID / X-Root-Request-ID，只有 message id
-    # 每请求新生成（见 wb_identity.new_turn_request_id）。生成在重试循环外，
-    # 循环里只把它传给身份构造；桌面端 / VSCode 分支不消费它，行为不变。
-    turn_request_id = wb_identity.new_turn_request_id()
+    # 一轮 user send 的 request id（X-Conversation-Request-ID / X-Root-Request-ID，
+    # 见 wb_identity.new_turn_request_id）。**每个账号的每次尝试各自生成一个**，
+    # 见下面重试循环里 turn_request_id 的赋值处——为什么要按账号隔离，别按官方
+    # 客户端那样整轮复用，那条注释写在那里。
     # Only pass `allowed` when the request actually carries a restriction: a
     # stub pool in tests (and any external pool implementation) keeps its old
     # count_ready signature for the unrestricted path.
@@ -14592,6 +15194,26 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         if key not in egress_wait:
             egress_wait[key] = wb_egress.note_transient(key)
         return egress_wait[key]
+
+    def rotate_pause():
+        """换到下一个账号之前先睡一段带抖动的短延迟（见 rotation_delay）。
+
+        只有「池里还有别的号可换」时才睡：单号池换不出去，睡只会白拖客户端
+        延迟；而这种情况下一次请求本来也不会把同一份 body 送到第二个账号。
+
+        睡之前先把刚失败那个号的在飞名额还掉（循环开头的兜底释放会因为
+        slot_held 已置空而变成空操作）：不还的话，这段 1~2 秒里它还占着并发
+        名额，`account_max_concurrent` 很小时会白挡掉一个本来能用的名额。
+        """
+        nonlocal slot_held
+        if total <= 1:
+            return
+        if slot_held is not None:
+            account_slot_release(slot_held)
+            slot_held = None
+        wait = rotation_delay()
+        if wait > 0:
+            time.sleep(wait)
 
     max_attempts = (1 if pinned is not None else
                     max(2, total) + 1 + (MAX_PRODUCT_SWITCHES if auto_switch else 0))
@@ -14720,7 +15342,16 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         # BaseAgent 的 32hex 形态每请求新生成，并带 X-Model-ID。
         # 缺了这套头上游的渠道校验会回 400 / code 11-128（conversation id
         # missing）。跨账号重试时按账号各自派生，不会把两个号串到同一个会话上。
-        # 重试换号时 session_key / turn_request_id / vscode_conversation_id 都不变。
+        #
+        # 一轮 user send 的 request id 也按账号隔离：官方 CLI 会在「同一轮（含
+        # 重试）」里复用同一个 X-Conversation-Request-ID / X-Root-Request-ID，但
+        # 它的重试永远落在同一个账号上；网关的换号重试如果照抄「整轮复用」，
+        # 上游就会在同一个出口 IP 上看到**两个不同账号收到同一个 request id**——
+        # 那是一条显式的关联键，等于替上游把「这两个号是同一台设备的一批」
+        # 写进请求头（社区复盘 #629/#664 的核心信号就是账号间关联性）。
+        # 所以这里每个账号的每次尝试重新生成；同一账号的同一轮内仍然只构造
+        # 一次头，本轮其余头（会话 id、message id 之外的一切）逐字节一致。
+        turn_request_id = wb_identity.new_turn_request_id()
         if account.product == wb_identity.PRODUCT_VSCODE:
             conv_id = vscode_conversation_id
         elif session_key:
@@ -14757,7 +15388,10 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             # The third element is the reasoning effort this request ran at: the
             # body is rebuilt per attempt, but the effort is a property of the
             # model and the request, and the callers record it on the usage row.
-            return resp, account, upstream_effort_of(upstream_body, model)
+            # §D5-2：这里是「实际跑的那一档」；客户端请求值与之不同时留一条日志。
+            effective_effort = upstream_effort_of(upstream_body, model)
+            note_effort_divergence(payload, model, effective_effort)
+            return resp, account, effective_effort
         except urllib.error.HTTPError as exc:
             if exc.code == 429:
                 try:
@@ -14775,6 +15409,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     last_error = exc
                     last_429 = exc
                     last_429_detail = detail
+                    rotate_pause()
                     continue
                 # No reset clock, so nothing here says whether the limit is on
                 # the credential or on one model. For a recognised soft-limit
@@ -14832,6 +15467,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 last_error = exc
                 last_429 = exc
                 last_429_detail = detail
+                rotate_pause()
                 continue
             if exc.code == 403:
                 try:
@@ -14863,6 +15499,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     if restricted_rotations >= RESTRICTED_403_ROTATE_MAX:
                         break
                     restricted_rotations += 1
+                    rotate_pause()
                     continue
                 # Panel degrade.go: a content rejection in passthrough/append
                 # mode is usually a system-prompt fingerprint false positive.
@@ -14875,6 +15512,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     upstream_body = build_upstream_body(payload)
                     tried.discard(account.uid)
                     log("upstream 403 (content review) -> degraded prompt retry")
+                    rotate_pause()
                     continue
                 log("upstream 403 for '%s' (content review), passing through" % model)
                 if session_key and POOL:
@@ -14893,6 +15531,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 if session_key and POOL:
                     POOL.affinity.demote(session_key, account.uid)
                 last_error = exc
+                rotate_pause()
                 continue
             if exc.code == 401:
                 if session_key and POOL:
@@ -14917,6 +15556,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                                    cooldown=60,
                                    single_account=(total <= 1))
                 last_error = exc
+                rotate_pause()
                 continue
             if exc.code == 400:
                 # A 400 is passed through unchanged. `11158` (model not allowed
@@ -14963,6 +15603,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 if session_key and POOL:
                     POOL.affinity.demote(session_key, account.uid)
                 last_error = exc
+                rotate_pause()
                 continue
             raise
         except Exception as exc:
@@ -15019,6 +15660,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 % (account.uid[:8], exc_detail(exc, 160),
                    3.0 if total <= 1 else 60.0, account.fails, total))
             last_error = exc
+            rotate_pause()
             continue
     # 循环可能从 break 退出（TLS 校验失败、已知硬错误），这时本轮占的名额还在
     # 手上；成功路径已经在 return 前把它交给响应对象并置空，所以这里释放是安全的。
@@ -15232,8 +15874,16 @@ def pool_unavailable_detail(realm, model=None):
 
 #: 「测试」默认用哪条模型：最便宜、任何区域都有的那条。
 TEST_MODEL_DEFAULT = "deepseek-v4.1-flash"
-#: 一键测试的并发度：每个探针都是一次真实的上游请求，别把池子打成压测。
-PROBE_CONCURRENCY = 4
+#: 一键测试的并发度：**串行是刻意的**。每个探针都是一次真实的上游请求，而
+#: 一次点击让池里每个号在同一秒各收一条一模一样的「最小请求」（同一 URL、
+#: 同一个 model、同一句 "hi"），从一个出口 IP 发出去，正是上游把多个账号关联
+#: 起来的最短路径（社区复盘 #629/#664：最强信号是账号之间的关联性，不是单条
+#: 请求的特征）。保留这个名字与值 1，是为了让"这条路径是串行的"成为显式约定
+#: 而不是某次重构顺手删掉的实现细节。
+PROBE_CONCURRENCY = 1
+#: 一键测试里账号之间的抖动下/上限（秒）：跨过秒边界，且并发不出同一个时刻。
+PROBE_STAGGER_MIN = 1.2
+PROBE_STAGGER_MAX = 3.0
 
 def _is_public_addr(text):
     """是不是一个可以直连的公网地址（拒绝环回/私有/链路本地/保留段）。"""
@@ -17006,9 +17656,10 @@ def messages_to_chat(payload):
     stops = payload.get("stop_sequences")
     if isinstance(stops, list) and stops:
         chat["stop"] = stops
-    metadata = payload.get("metadata")
-    if isinstance(metadata, dict) and metadata.get("user_id") is not None:
-        chat["user"] = metadata.get("user_id")
+    # §D3：**不再**把 metadata.user_id 抬成 user。Anthropic 的 metadata 是客户端
+    # 自用的记账字段，user_id 是终端用户标识；抬成 OpenAI 的 user 之后它会跟着
+    # 请求出站，而这台网关是用一个出口冒充多台设备——那串 id 反而成了把多个账号
+    # 串起来的线索。metadata 里其余字段本来就不进 chat body。
     tools, skipped = anthropic_tools_to_chat(payload.get("tools"))
     if tools:
         chat["tools"] = tools
@@ -18116,6 +18767,98 @@ def _release_key_slot(key_entry):
 BODYLESS_PANEL_POSTS = ("/console/toggle", "/shutdown", "/updates/check",
                         "/updates/install", "/quota-scan/run")
 
+# --- 手动任务入口的统一门闸与错峰（§C4）-------------------------------------
+# 面板上的「一键签到 / 每日活跃 / 网页打卡 / 成长任务 / 猫猫旅行 / 连登管家」都是
+# **手动**出站路径，过去各自复制了一份账号筛选：`/accounts/checkin` 连 uid 分支都
+# 不过 realm，而六条入口**全都不看** `restricted_until` 与区域连坐暂停——巡检明明
+# 跳过了受限号，运维点一下按钮就把整池又打了一遍，且账号之间零 sleep（几条各自
+# 写死 1.0 / 1.5 秒，签到那条连 sleep 都没有）。
+#
+# 判据只有一份：与 `wb_scheduler.Scheduler._blocked_reason()` 同源同序（账号级
+# `restricted_until` + realm 级 `restriction_hold_remaining`）。**改口径时两处一起
+# 改**，否则面板一键就能绕过巡检遵守的红线。
+def manual_task_blocked_reason(account):
+    """手动入口：这个账号此刻不该出站的原因；空串 = 可以出站。"""
+    try:
+        restricted = getattr(account, "restricted_until", 0.0) or 0.0
+        if restricted > time.time():
+            return "上游风控限制剩余 %ds" % max(0, int(restricted - time.time()))
+    except (TypeError, ValueError):
+        pass
+    realm = str(getattr(account, "realm", "") or "")
+    try:
+        hold = restriction_hold_remaining(realm)
+    except Exception:
+        hold = 0.0
+    if hold > 0:
+        return "%s 区域风控暂停剩余 %ds" % (realm or "?", max(0, int(hold)))
+    return ""
+
+
+def manual_task_targets(candidates, force=False):
+    """把候选账号分成（可出站, 被跳过并带原因）两组。
+
+    `force=True` 是运维在面板上显式勾「我确实要试这个号」时才该出现的东西：
+    受限账号（`restrictedUntil` 仍在期内）或区域暂停期间**默认一律不出站**——
+    封号波之后点一次按钮就再打一遍，正是把整池送走的那条路。
+    """
+    allowed, skipped, seen = [], [], set()
+    for account in candidates or ():
+        if account is None:
+            continue
+        uid = str(getattr(account, "uid", "") or "")
+        if uid and uid in seen:
+            continue
+        if uid:
+            seen.add(uid)
+        reason = "" if force else manual_task_blocked_reason(account)
+        if reason:
+            skipped.append({"uid": uid,
+                            "nickname": getattr(account, "nickname", "") or uid[:8],
+                            "reason": reason})
+            continue
+        allowed.append(account)
+    return allowed, skipped
+
+
+def manual_task_skipped_note(skipped):
+    """被跳过账号的一句话说明（拼进返回体的 msg，面板直接显示）。"""
+    if not skipped:
+        return ""
+    detail = "；".join("%s %s" % (item["nickname"], item["reason"])
+                      for item in skipped)
+    return "已跳过 %d 个账号（%s）。确需强行执行请带 force=true。" % (
+        len(skipped), detail)
+
+
+#: 手动批量入口的账号间错峰（秒）。默认复用调度器那一份常量（issue #394 的
+#: 2~5 秒），这样运维改一个 env（WB_SCHEDULER_STAGGER_MIN/_MAX）就同时覆盖面板
+#: 与巡检；取不到时才回落到这里的同一组数，**不要**在各路由里再写死一份。
+MANUAL_STAGGER_FALLBACK = (2.0, 5.0)
+
+
+def manual_stagger_bounds():
+    """(最小, 最大) 错峰秒数：优先用调度器的口径。"""
+    lo, hi = MANUAL_STAGGER_FALLBACK
+    try:
+        import wb_scheduler
+        lo = float(getattr(wb_scheduler, "SCHEDULER_STAGGER_MIN", lo))
+        hi = float(getattr(wb_scheduler, "SCHEDULER_STAGGER_MAX", hi))
+    except Exception:
+        pass
+    lo = max(0.0, lo)
+    hi = max(0.0, hi)
+    return lo, max(lo, hi)
+
+
+def manual_stagger():
+    """这一次手动批量出站前该睡多久（秒）；0 表示不睡。"""
+    lo, hi = manual_stagger_bounds()
+    if hi <= 0:
+        return 0.0
+    return lo if hi <= lo else random.uniform(lo, hi)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     # 关掉 Nagle（对连接设 TCP_NODELAY）：响应头和响应体是两次独立 write，Nagle
@@ -18197,7 +18940,11 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.8.0"
+    # 1.8.4 = 本地补丁版（非上游发版）：任务链路 403/11140 落盘 restrictedUntil
+    # （wb_accounts.note_restriction_from_error）+ 调度错峰可配
+    # （wb_scheduler.SCHEDULER_STAGGER_MIN/_MAX）。两处版本号必须一致，
+    # tests/_test_release_engineering.py 钉着这一条。
+    server_version = "wb-proxy/1.8.4"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -20416,13 +21163,14 @@ class Handler(BaseHTTPRequestHandler):
                 if vision:
                     entry["supports_vision"] = True
                 # 可选的思考档位交给客户端（DSH 用它生成会话里的档位选择器）。
-                # 只宣告目录明确列出档位的模型：固定档位的模型（只有
-                # reasoning.effort、没有 supportedEfforts）不列，选了也不会改变
-                # 上游实际跑的档位。
-                efforts = (meta.get("reasoning") or {}).get("supportedEfforts")
-                if isinstance(efforts, (list, tuple)):
-                    levels = [str(e).strip() for e in efforts
-                              if str(e or "").strip()]
+                # §D5：与 /v1/models 走**同一个** advertised_reasoning()——一键配置
+                # 会把这里声明的档位写进客户端配置，若一边广告 low/high/max、另一
+                # 边出站又把 max 收敛成 high，客户端选的就是一个不会生效的档位。
+                # 只广告上游自己声明过的那几档；声明只有一档就只给那一档。
+                declared = advertised_reasoning(mid, meta.get("reasoning") or {})
+                levels = declared.get("supportedEfforts")
+                if isinstance(levels, (list, tuple)):
+                    levels = [str(e).strip() for e in levels if str(e or "").strip()]
                     if levels:
                         entry["reasoning_efforts"] = levels
                 models.append(entry)
@@ -20864,6 +21612,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json_panel(200, {"ok": False, "msg": "账号池不可用"})
         invalidate_tasks_cache()          # 跑完任务状态就变了，别再端旧快照
         uid = payload.get("uid")
+        force = payload.get("force") is True
         if uid and uid != "all":
             target = POOL.get(uid)
             if not target or target.realm != "cn":
@@ -20873,6 +21622,13 @@ class Handler(BaseHTTPRequestHandler):
             targets = POOL.task_accounts("cn")
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
+        # §C4：受限 / 区域暂停中的号默认不出站（判据见 manual_task_blocked_reason）。
+        targets, skipped = manual_task_targets(targets, force=force)
+        if not targets:
+            return self._json_panel(200, {
+                "ok": False, "msg": manual_task_skipped_note(skipped),
+                "credit_added": 0, "logs": [], "accounts_count": 0,
+                "skipped": skipped})
         from wb_tasks import run_growth_tasks
         claim = payload.get("claim", True) is not False
         combined_logs = []
@@ -20889,14 +21645,16 @@ class Handler(BaseHTTPRequestHandler):
             for l in res.get("logs") or []:
                 combined_logs.append(f"  {l}")
             if i < len(targets) - 1:
-                time.sleep(1.5)
+                # §C4：账号之间错峰（与调度器同一口径），不再写死 1.5 秒。
+                time.sleep(manual_stagger())
         combined_logs.append(f"====== 全部 {len(targets)} 个账号任务执行完毕，累计新增积分: +{total_credit} ======")
         add_log_entry(f"[任务福利] 批量成长任务执行完成，共 {len(targets)} 个账号，新增积分 +{total_credit}", tag="tasks")
         return self._json_panel(200, {
             "ok": True,
             "credit_added": total_credit,
             "logs": combined_logs,
-            "accounts_count": len(targets)
+            "accounts_count": len(targets),
+            "skipped": skipped,
         })
 
     def _route_tasks_claim(self, payload):
@@ -20911,6 +21669,15 @@ class Handler(BaseHTTPRequestHandler):
         target = POOL.get(uid)
         if not target or target.realm != "cn":
             return self._json_panel(200, {"ok": False, "msg": "未找到指定的国内版账号"})
+        # §C4：领任务也是一次真实出站，同一套门闸（单号 + force 才越过）。
+        if payload.get("force") is not True:
+            reason = manual_task_blocked_reason(target)
+            if reason:
+                note = manual_task_skipped_note([{
+                    "uid": target.uid,
+                    "nickname": target.nickname or target.uid[:8],
+                    "reason": reason}])
+                return self._json_panel(200, {"ok": False, "msg": note, "credit": 0})
         from wb_tasks import claim_task
         res = claim_task(target, code)
         invalidate_tasks_cache()
@@ -20934,6 +21701,11 @@ class Handler(BaseHTTPRequestHandler):
             targets = POOL.task_accounts("cn")
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
+        # §C4：门闸 + 错峰（判据同 manual_task_blocked_reason，不再写死 1.0 秒）。
+        targets, skipped = manual_task_targets(targets, force=payload.get("force") is True)
+        if not targets:
+            return self._json_panel(200, {"ok": False, "msg": manual_task_skipped_note(skipped),
+                                          "skipped": skipped})
         from wb_tasks import run_streak_bonus
         results = []
         for i, acc in enumerate(targets):
@@ -20943,8 +21715,11 @@ class Handler(BaseHTTPRequestHandler):
             results.append(f"{nick}: {res.get('msg')}")
             add_log_entry(f"[任务福利] 账号 [{nick}] 连登管家与抽奖: {res.get('msg')}", tag="tasks")
             if i < len(targets) - 1:
-                time.sleep(1.0)
-        return self._json_panel(200, {"ok": True, "msg": chr(10).join(results)})
+                time.sleep(manual_stagger())
+        note = manual_task_skipped_note(skipped)
+        return self._json_panel(200, {"ok": True,
+                                      "msg": chr(10).join(results + ([note] if note else [])),
+                                      "skipped": skipped})
 
     def _route_tasks_travel(self, payload):
         if not POOL:
@@ -20960,6 +21735,12 @@ class Handler(BaseHTTPRequestHandler):
             targets = POOL.task_accounts("cn")
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
+        # §C4：同上。
+        targets, skipped = manual_task_targets(targets, force=payload.get("force") is True)
+        if not targets:
+            return self._json_panel(200, {"ok": False, "msg": manual_task_skipped_note(skipped),
+                                          "results": [], "accounts_count": 0,
+                                          "skipped": skipped})
         from wb_tasks import do_cat_travel
         results = []
         for i, acc in enumerate(targets):
@@ -20975,15 +21756,19 @@ class Handler(BaseHTTPRequestHandler):
                 "reward_credit": res.get("credit", 0)
             })
             if i < len(targets) - 1:
-                time.sleep(1.0)
+                time.sleep(manual_stagger())
         summary_msg = chr(10).join([f"{r['nickname']}: {r['msg']}" for r in results])
         for r in results:
             add_log_entry(f"[任务福利] 账号 [{r['nickname']}] 猫猫旅行: {r['msg']}", tag="tasks")
+        note = manual_task_skipped_note(skipped)
+        if note:
+            summary_msg = summary_msg + chr(10) + note
         return self._json_panel(200, {
             "ok": True,
             "results": results,
             "msg": summary_msg,
-            "accounts_count": len(targets)
+            "accounts_count": len(targets),
+            "skipped": skipped,
         })
 
     def _route_update_check(self):
@@ -21167,27 +21952,58 @@ class Handler(BaseHTTPRequestHandler):
         # 只挑有个人成长体系的号：静态 API Key 与企业号都没有，签到端点对它们
         # 一律拒绝，发过去只是白烧一次上游请求。
         # 任务开关（#521）同样要遵守：停用任务参与的号不跑签到。
-        targets = ([POOL.get(uid)] if uid
-                   else [a for a in (POOL.accounts if POOL else [])
-                         if a.realm == "cn"
-                         and a.task_active()
-                         and not a.uses_enterprise_billing()])
+        note = ""
+        if uid:
+            target = POOL.get(uid) if POOL else None
+            # §C4：显式点名也要过 realm——过去这里连 realm 都不过滤，一个 intl
+            # 或拼错的 uid 会被原样送进签到端点（白烧一次上游请求）。
+            if target is None:
+                note = "未找到指定的账号"
+                targets = []
+            elif target.realm != "cn":
+                note = "签到只支持国内版账号"
+                targets = []
+            else:
+                targets = [target]
+        else:
+            targets = [a for a in (POOL.accounts if POOL else [])
+                       if a.realm == "cn"
+                       and a.task_active()
+                       and not a.uses_enterprise_billing()]
+        # §C4：受限 / 区域暂停中的号默认不出站；批量时账号之间错峰。
+        targets, skipped = manual_task_targets(targets, force=payload.get("force") is True)
+        if not targets:
+            return self._json_panel(200, {
+                "results": [], "accounts": account_views(), "skipped": skipped,
+                "msg": manual_task_skipped_note(skipped) or note or "没有可签到的账号"})
         results = []
-        for account in targets:
-            if account is None:
-                continue
+        for i, account in enumerate(targets):
+            if i:
+                time.sleep(manual_stagger())
             res = account.checkin(trigger="manual")
             nick = account.nickname or account.uid[:8]
             add_log_entry(f"[任务福利] 账号 [{nick}] 每日签到: {res.get('msg') if res.get('ok') else res.get('error')}",
                           level="INFO" if res.get("ok") else "WARN", tag="tasks")
             results.append({"uid": account.uid, "nickname": account.nickname, **res})
-        return self._json_panel(200, {"results": results, "accounts": account_views()})
+        return self._json_panel(200, {"results": results, "accounts": account_views(),
+                                      "skipped": skipped,
+                                      "msg": manual_task_skipped_note(skipped)})
 
     def _route_accounts_daily_chat(self, payload):
         uid = payload.get("uid")
         uids = payload.get("uids")
+        note = ""
         if uid:
-            targets = [POOL.get(uid)]
+            target = POOL.get(uid) if POOL else None
+            # §C4：同签到——显式 uid 也要过 realm。
+            if target is None:
+                note = "未找到指定的账号"
+                targets = []
+            elif target.realm != "intl":
+                note = "每日活跃打卡只支持国际版账号"
+                targets = []
+            else:
+                targets = [target]
         elif isinstance(uids, list):
             # 「未活跃打卡一键打卡」：面板把今天还没打过卡的国际版账号列成名单送进来，
             # 这里只按名单精确执行——已经打过的那批不再打第二遍（重复打卡不给积分，
@@ -21200,10 +22016,16 @@ class Handler(BaseHTTPRequestHandler):
                        if a.realm == "intl" and a.task_active() and str(a.uid) in wanted]
         else:
             targets = POOL.task_accounts("intl")
+        # §C4：门闸 + 错峰（过去这条入口零 sleep、也不看 restrictedUntil）。
+        targets, skipped = manual_task_targets(targets, force=payload.get("force") is True)
+        if not targets:
+            return self._json_panel(200, {
+                "results": [], "accounts": account_views(), "skipped": skipped,
+                "msg": manual_task_skipped_note(skipped) or note or "没有可打卡的账号"})
         results = []
-        for account in targets:
-            if account is None:
-                continue
+        for i, account in enumerate(targets):
+            if i:
+                time.sleep(manual_stagger())
             res = account.daily_chat(trigger="manual")
             # 与网页通道打卡那条一样把结果写进运行日志：msg 里带着网页通道是
             # completed 还是失败原因，面板上光看 toast 的「成功」看不出来。
@@ -21211,7 +22033,9 @@ class Handler(BaseHTTPRequestHandler):
             log(f"[任务福利] 账号 [{nick}] 每日活跃打卡: {res.get('msg') if res.get('ok') else res.get('error')}",
                 level="INFO" if res.get("ok") else "WARN", tag="tasks")
             results.append({"uid": account.uid, "nickname": account.nickname, **res})
-        return self._json_panel(200, {"results": results, "accounts": account_views()})
+        return self._json_panel(200, {"results": results, "accounts": account_views(),
+                                      "skipped": skipped,
+                                      "msg": manual_task_skipped_note(skipped)})
 
     def _route_accounts_daily_chat_web(self, payload):
         """网页通道打卡：只建网页端会话，不发桌面端那条轻量对话。
@@ -21220,20 +22044,37 @@ class Handler(BaseHTTPRequestHandler):
         手动补一次不该让定时巡检跳过当天的正常流程。
         """
         uid = payload.get("uid")
+        note = ""
         if uid:
-            targets = [POOL.get(uid)]
+            target = POOL.get(uid) if POOL else None
+            if target is None:
+                note = "未找到指定的账号"
+                targets = []
+            elif target.realm != "intl":
+                note = "网页通道打卡只支持国际版账号"
+                targets = []
+            else:
+                targets = [target]
         else:
             targets = POOL.task_accounts("intl")
+        # §C4：门闸 + 错峰。
+        targets, skipped = manual_task_targets(targets, force=payload.get("force") is True)
+        if not targets:
+            return self._json_panel(200, {
+                "results": [], "accounts": account_views(), "skipped": skipped,
+                "msg": manual_task_skipped_note(skipped) or note or "没有可打卡的账号"})
         results = []
-        for account in targets:
-            if account is None:
-                continue
+        for i, account in enumerate(targets):
+            if i:
+                time.sleep(manual_stagger())
             res = account.daily_chat_web(trigger="manual")
             nick = account.nickname or account.uid[:8]
             log(f"[任务福利] 账号 [{nick}] 网页通道打卡: {res.get('conversation') if res.get('ok') else res.get('error')}",
                 level="INFO" if res.get("ok") else "WARN", tag="tasks")
             results.append({"uid": account.uid, "nickname": account.nickname, **res})
-        return self._json_panel(200, {"results": results, "accounts": account_views()})
+        return self._json_panel(200, {"results": results, "accounts": account_views(),
+                                      "skipped": skipped,
+                                      "msg": manual_task_skipped_note(skipped)})
 
     def _route_accounts_login_start(self, payload):
         platform = payload.get("platform") or "CLI"
@@ -21391,37 +22232,65 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, result)
 
     def _route_accounts_test_all(self, payload):
-        """一键测试：该区域每个已启用账号各打一条最小请求，外加一条本机连通性。
+        """一键测试：该区域每个**此刻可用**的账号各打一条最小请求，外加本机连通性。
 
         面板上的「测试」原先只能一个个点，而池子出问题时最需要的偏偏是一次看全：
         哪个账号真不行、哪个只是被本地窗口（熔断 / 降权 / 软限流）关着——测试成功
         会顺手把这些计数清掉——以及本机网络通不通。断网时每个账号都会失败，只报
         「账号全挂了」的话，用户只能看着一屏红点猜。
+
+        两条与风控相关的口径，和 `wb_scheduler` 的巡检保持一致：
+
+        * **不可用的号不探测**。过去只按 `realm + enabled` 选目标，于是被上游
+          11140 限制的号（`restrictedUntil` 仍在期内）照样再吃一条真实请求——
+          而这正是封号波之后运维最常点的那个按钮。现在用
+          `unavailable_reason()` 挡下受限 / 熔断 / 降权 / 余额保护 / 冷却 /
+          模型冷却 / 额度用尽 / 凭证过期这几类，被挡下的号连同原因一起回给面板。
+        * **串行 + 抖动**。每个探针都是一次真实的上游请求；并发探测就是「同一
+          出口 IP 在同一秒内，池里每个号各收一条一模一样的请求」，那正是把多个
+          账号关联起来的特征（见 PROBE_CONCURRENCY 与 PROBE_STAGGER_*）。
         """
         realm = str(payload.get("realm") or "").strip().lower()
         if realm not in ("intl", "cn"):
             realm = CURRENT_REALM
         model = payload.get("model") or TEST_MODEL_DEFAULT
-        targets = [a for a in (POOL.accounts if POOL else [])
-                   if a.realm == realm and a.enabled]
+        targets = []
+        skipped = []
+        for account in (POOL.accounts if POOL else []):
+            if account.realm != realm or not account.enabled:
+                continue
+            try:
+                reason = account.unavailable_reason(model=model)
+            except Exception:
+                reason = ""
+            if reason:
+                skipped.append({"uid": account.uid,
+                                "nickname": account.nickname or account.uid[:8],
+                                "reason": reason})
+                continue
+            targets.append(account)
         started = time.time()
         network = probe_local_network(realm)
         rows = []
-        if targets:
-            from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=min(PROBE_CONCURRENCY, len(targets))) as pool:
-                rows = list(pool.map(lambda acc: probe_account(acc, model), targets))
+        for index, account in enumerate(targets):
+            if index:
+                # 跨过秒边界再做下一个号（见 PROBE_STAGGER_MIN/_MAX）。
+                lo, hi = PROBE_STAGGER_MIN, PROBE_STAGGER_MAX
+                time.sleep(lo if hi <= lo else random.uniform(lo, hi))
+            rows.append(probe_account(account, model))
         passed = [r for r in rows if r.get("ok")]
         failed = [r for r in rows if not r.get("ok")]
         summary = {"realm": realm, "model": model, "tested": len(rows),
                    "passed": len(passed), "failed": len(failed),
+                   "skipped": len(skipped),
                    "networkDown": not network.get("ok"),
                    "elapsed_ms": int((time.time() - started) * 1000)}
-        log("test all: realm=%s model=%s tested=%d passed=%d failed=%d network=%s"
-            % (realm, model, len(rows), len(passed), len(failed),
+        log("test all: realm=%s model=%s tested=%d passed=%d failed=%d skipped=%d network=%s"
+            % (realm, model, len(rows), len(passed), len(failed), len(skipped),
                "ok" if network.get("ok") else "DOWN"), tag="accounts")
         return self._json_panel(200, {"ok": True, "summary": summary, "network": network,
-                                "results": rows, "accounts": account_views()})
+                                "results": rows, "skipped": skipped,
+                                "accounts": account_views()})
 
     def _route_accounts_set(self, payload):
         uid = payload.get("uid")
@@ -22952,6 +23821,9 @@ def _bootstrap_runtime(args):
     # 目录兜底：每天至少从上游 API 取一次（活跃使用的部署里 300s 缓存早就
     # 刷得更新，这个线程只兜长时间没人访问 / 一直吃缓存文件或内置快照）。
     start_catalog_daily()
+    # 目录预热（§D5）：/v1/models 的档位声明只读 live 口径，而 live 口径要等目录
+    # 构建过才有；catalog_daily_loop 先睡 60 秒，这里抢在监听开始前后补齐窗口。
+    start_catalog_prewarm(POOL)
     global PRICING
     # The policy table and its timeline live beside the usage log, so one
     # volume carries both and the request references resolve locally.

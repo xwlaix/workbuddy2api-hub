@@ -219,8 +219,14 @@ class RemoteCatalogTests(unittest.TestCase):
         self.assertEqual(item["reasoning_efforts"], ["low", "medium", "high"])
         self.assertEqual(item["reasoning_default_effort"], "medium")
 
-    def test_bundled_efforts_fill_in_when_the_live_entry_has_none(self):
-        """A silent live entry falls back to the snapshot, and says so once."""
+    def test_a_silent_live_entry_advertises_no_levels(self):
+        """A silent live entry still falls back to the snapshot for the merge.
+
+        §D5 改了**对外声明**那一侧：live 明确知道这个模型却没声明档位时，
+        /v1/models 一档都不广告（否则客户端选 max、实际跑 high）。合并块本身
+        不变，面板/推测值仍然拿得到快照补出来的三档，所以这里继续断言
+        merge 的兜底日志。
+        """
         logged = []
         original_log = P.log
         P.log = lambda message, **kw: logged.append(message)
@@ -233,18 +239,18 @@ class RemoteCatalogTests(unittest.TestCase):
             P.log = original_log
         item = P.model_entry("deepseek-v4.1-flash",
                              entries["deepseek-v4.1-flash"])
-        self.assertEqual(item["reasoning_efforts"], ["low", "high", "max"])
-        self.assertEqual(item["reasoning_default_effort"], "high")
+        self.assertNotIn("reasoning_efforts", item)
+        self.assertNotIn("reasoning_default_effort", item)
         self.assertTrue(any("bundled table" in m for m in logged), logged)
 
-    def test_bare_live_effort_keeps_the_model_selectable(self):
-        """Issue #170: a bare live `effort` is the default, not a pin.
+    def test_a_bare_live_effort_is_advertised_as_that_single_level(self):
+        """Issue #170 revisited (§D5): advertise exactly what will actually run.
 
-        The endpoint answers with {"effort": "high"} for deepseek-v4.1-flash
-        while the bundled table knows the level is selectable. Taking the live
-        block at face value dropped supportedEfforts, so /v1/models advertised
-        the model as pinned to high - and every request was recorded at high
-        even when the client sent max, the level it was really forwarded with.
+        The endpoint answers {"effort": "high"} for deepseek-v4.1-flash. 出站放行
+        只认 live 声明过的那一份（_enforce_live_effort），所以客户端发 max 时真正
+        跑的是 high；过去 /v1/models 却用内置快照补出的 low/high/max 去广告，
+        客户端因此能选一个不会生效的档位。现在两边同源：只广告 high，且发 max
+        的请求在出站时收敛到 high。
         """
         meta = dict(INTL_META)
         meta["deepseek-v4.1-flash"] = {
@@ -263,19 +269,20 @@ class RemoteCatalogTests(unittest.TestCase):
             P.log = original_log
         item = P.model_entry("deepseek-v4.1-flash",
                              entries["deepseek-v4.1-flash"])
-        self.assertEqual(item["reasoning_efforts"], ["low", "high", "max"])
+        self.assertEqual(item["reasoning_efforts"], ["high"])
         self.assertEqual(item["reasoning_default_effort"], "high")
-        self.assertNotIn("reasoning_fixed_effort", item)
-        # The level the request really ran at follows the client again.
+        self.assertEqual(item["reasoning_fixed_effort"], "high")
+        # 同一份口径：声明只有 high，出站也把 max 收敛到 high（不再"声明一套、跑一套"）。
         self.assertIsNone(P.model_fixed_effort("deepseek-v4.1-flash"))
-        self.assertEqual(
-            P.upstream_effort_of({"reasoning_effort": "max"},
-                                 "deepseek-v4.1-flash"),
-            "max")
-        # A model the live catalogue really does pin is untouched: no snapshot
-        # supportedEfforts to restore, so its bare effort still pins it.
+        wire = P._enforce_live_effort({"reasoning_effort": "max"},
+                                      "reasoning_effort", "max",
+                                      "deepseek-v4.1-flash")
+        self.assertEqual(wire["reasoning_effort"], "high")
+        # A model the live catalogue does not describe at all is not advertised
+        # either: 内置快照给 gemini-3.5-flash 的那个固定 medium 只留在面板上
+        # （推测/提示用），对外声明一档都不说。
         pinned = P.model_entry("gemini-3.5-flash", entries["gemini-3.5-flash"])
-        self.assertEqual(pinned["reasoning_fixed_effort"], "medium")
+        self.assertNotIn("reasoning_fixed_effort", pinned)
         self.assertNotIn("reasoning_efforts", pinned)
         # And the shape is announced, not applied silently.
         self.assertTrue(any("bundled table" in m for m in logged), logged)

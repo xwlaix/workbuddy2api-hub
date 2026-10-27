@@ -671,6 +671,12 @@ def resolve_device_token(accounts_dir):
     token to a file, the gateway reads it (max 1KB, trimmed) and caches
     the result for five minutes so the header hot path stays cheap.
     Failures degrade to an empty token instead of breaking a request.
+
+    这是**全局**口径（settings 里的一个值），只在本进程只有一个可发 token 的
+    国内版账号时才允许真正上线——多账号共用同一个真实设备 token 是服务端可以
+    直接 join 的指纹，比不发更糟（见 device_token_scope / Account._device_token）。
+    账号级配置（账号 JSON 的 deviceToken / deviceTokenFile）优先，见
+    resolve_account_device_token。
     """
     try:
         cfg = wb_settings.upstream_config(accounts_dir)
@@ -686,16 +692,201 @@ def resolve_device_token(accounts_dir):
         if (_DEVICE_TOKEN_CACHE["key"] == key
                 and now - _DEVICE_TOKEN_CACHE["at"] < _DEVICE_TOKEN_TTL):
             return _DEVICE_TOKEN_CACHE["token"]
-    token = literal
-    if not token and path:
-        try:
-            if os.path.getsize(path) <= _DEVICE_TOKEN_MAX_BYTES:
-                with open(path, encoding="utf-8") as fh:
-                    token = fh.read().strip()
-        except Exception:
-            token = ""
+    token = _read_device_token(literal, path)
     with _DEVICE_TOKEN_LOCK:
         _DEVICE_TOKEN_CACHE.update({"key": key, "token": token, "at": now})
+    return token
+
+
+def _read_device_token(literal, path):
+    """字面量优先，其次按 _DEVICE_TOKEN_MAX_BYTES 上限读文件；失败回空串。
+
+    抽出来给全局口径和账号级口径共用，两条路只有缓存维度不同。
+    """
+    token = str(literal or "").strip()
+    if token:
+        return token
+    path = str(path or "").strip()
+    if not path:
+        return ""
+    try:
+        if os.path.getsize(path) <= _DEVICE_TOKEN_MAX_BYTES:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read().strip()
+    except Exception:
+        return ""
+    return ""
+
+
+#: 账号级 token 的缓存：key -> (token, at)。全局那条仍是单槽（_DEVICE_TOKEN_CACHE），
+#: 这里必须多槽——N 个账号各有各的 token 文件，单槽会每请求互相踢掉、每次都读盘。
+_ACCOUNT_DEVICE_TOKEN_CACHE = {}
+_ACCOUNT_DEVICE_TOKEN_MAX = 128   # 上限，防账号被反复增删时无界增长
+
+
+def resolve_account_device_token(literal, path, now=None):
+    """账号自己的 X-Device-Token（账号 JSON 的 deviceToken / deviceTokenFile）。
+
+    优先级：账号级 > settings 全局。缓存与全局同款（_DEVICE_TOKEN_TTL 内不重读、
+    _DEVICE_TOKEN_MAX_BYTES 上限），但按 key 分槽，所以多个账号可以各自持有不同
+    的真实设备 token——这正是「每账号一台设备」在设备凭据维度的落地。
+    """
+    literal = str(literal or "").strip()
+    path = str(path or "").strip()
+    key = literal or path
+    if not key:
+        return ""
+    now = time.time() if now is None else now
+    with _DEVICE_TOKEN_LOCK:
+        entry = _ACCOUNT_DEVICE_TOKEN_CACHE.get(key)
+        if isinstance(entry, tuple) and len(entry) == 2:
+            token, at = entry
+            if isinstance(at, (int, float)) and now - at < _DEVICE_TOKEN_TTL:
+                return token
+    token = _read_device_token(literal, path)
+    with _DEVICE_TOKEN_LOCK:
+        _ACCOUNT_DEVICE_TOKEN_CACHE[key] = (token, now)
+        if len(_ACCOUNT_DEVICE_TOKEN_CACHE) > _ACCOUNT_DEVICE_TOKEN_MAX:
+            # 只丢最老的一半：账号池通常远小于上限，这一步几乎不会触发。
+            ordered = sorted(_ACCOUNT_DEVICE_TOKEN_CACHE.items(),
+                             key=lambda item: item[1][1]
+                             if isinstance(item[1], tuple) else 0.0)
+            for stale_key, _entry in ordered[:len(ordered) // 2]:
+                _ACCOUNT_DEVICE_TOKEN_CACHE.pop(stale_key, None)
+    return token
+
+
+#: 全局 device token 的处理口径。
+#:   auto   —— 默认。只在「本进程只有一个会用到全局值的国内版非 CLI 账号」时才发；
+#:             多于一个就整条头停用并 WARN（多账号共用一个真实设备 token，服务端
+#:             直接 join 就能把整批号认成同一台设备，比不发更糟）。
+#:   global —— 强行沿用旧行为（全池共用一个值）。是给「我只有一个号」或明确自担
+#:             风险的人留的逃生口，注释与日志里都会写清风险。
+#:   off    —— 一律不发（连账号级也不发以外的情形一并关掉全局值）。
+DEVICE_TOKEN_SCOPE_ENV = "WB_DEVICE_TOKEN_SCOPE"
+DEVICE_TOKEN_SCOPES = ("auto", "global", "off")
+#: 只在真的发生「多账号共用被停用」时记一次，避免每请求刷屏。
+_DEVICE_TOKEN_WARNED = {"count": 0}
+
+
+def device_token_scope():
+    """WB_DEVICE_TOKEN_SCOPE 的生效值；非法或未设 = auto。"""
+    raw = str(os.environ.get(DEVICE_TOKEN_SCOPE_ENV) or "").strip().lower()
+    return raw if raw in DEVICE_TOKEN_SCOPES else "auto"
+
+
+#: 共享计数的短缓存：headers() 是热路径，不该每次请求都遍历池子。
+_SHARED_TOKEN_CACHE = {"at": 0.0, "pool": None, "realm": None, "count": 1}
+_SHARED_TOKEN_TTL = 5.0
+
+
+def _sharing_accounts(pool, realm=None):
+    """池子里「会用到全局 device token」的账号：启用 + 非 CLI + 未自备。
+
+    `realm=None` 表示全部区域；给定 realm 时只看那个区域。为什么要分：
+    国内版账号在 chat 与计费两条链路上都会带这个头，所以对国内版来说「和它共用
+    同一个全局值」的只有其它国内版账号；国际版的 chat 不发（#448），但计费链路
+    仍会带——此时和它共用的就是全池所有非 CLI 号。按「谁真的会和它撞在同一个
+    join 键上」来数，才不会漏（1 个国内版 + 3 个国际版的池子里，国际版这一侧
+    本来已经在共用同一个真实设备凭据了）。
+
+    自备（账号 JSON 有 deviceToken / deviceTokenFile）的号不吃全局值，不算在
+    共享人数里——它们本来就是各自一台设备。这里只看配置不看文件内容，避免热
+    路径读盘。
+    """
+    try:
+        with pool._lock:
+            accounts = list(pool.accounts)
+    except Exception:
+        return []
+    out = []
+    for account in accounts:
+        try:
+            if not account.enabled:
+                continue
+            if realm is not None and account.realm != realm:
+                continue
+            if account.is_cli_identity():
+                continue
+            if (account.device_token or "").strip() or \
+                    (account.device_token_file or "").strip():
+                continue
+        except Exception:
+            continue
+        out.append(account)
+    return out
+
+
+def device_token_sharing_count(account=None, now=None):
+    """和 `account` 共用同一个**全局** device token 的账号数（下限 1）。
+
+    国内版账号按「启用中的国内版非 CLI 号」数；其它区域按全池数（它们只在计费
+    链路上带这个头，见 `_sharing_accounts`）。`account` 不在当前池里（面板单测、
+    一次性探测脚本、被手动摘出来的号）时一律按 1 算：那种情况下全局值本来就没
+    有第二个使用者。
+    """
+    pool = getattr(account, "_owner_pool", None)
+    if pool is None:
+        return 1
+    try:
+        realm = account.realm
+    except Exception:
+        realm = None
+    scope = realm if realm == "cn" else None
+    now = time.time() if now is None else now
+    with _DEVICE_TOKEN_LOCK:
+        cached = _SHARED_TOKEN_CACHE
+        if (cached.get("pool") is pool
+                and cached.get("realm") == scope
+                and isinstance(cached.get("at"), (int, float))
+                and now - cached["at"] < _SHARED_TOKEN_TTL):
+            count = cached.get("count")
+            if isinstance(count, int) and count > 0:
+                return count
+    sharing = _sharing_accounts(pool, realm=scope)
+    if not any(item is account for item in sharing):
+        return 1
+    count = max(1, len(sharing))
+    with _DEVICE_TOKEN_LOCK:
+        _SHARED_TOKEN_CACHE.update({"at": now, "pool": pool,
+                                    "realm": scope, "count": count})
+    return count
+
+
+def _warn_device_token_withheld(count):
+    """全局 device token 因多账号共用而停用：只记一次 WARN。"""
+    if _DEVICE_TOKEN_WARNED.get("count"):
+        return
+    _DEVICE_TOKEN_WARNED["count"] = int(count)
+    message = (
+        "全局 device token 会让 %d 个账号在服务端可被 join 成同一台设备"
+        "（同一个真实 TuringShield 设备凭据），已停用该头；请改用账号级 "
+        "deviceToken / deviceTokenFile。需要旧行为请设 WB_DEVICE_TOKEN_SCOPE=global。"
+        % int(count))
+    try:
+        # 懒导入：wb_proxy 反向 import wb_accounts，模块级导入会成环。
+        import wb_proxy as _proxy
+        _proxy.log(message)
+    except Exception:
+        pass
+
+
+def global_device_token(accounts_dir, account=None, now=None):
+    """全局 device token 在本进程现在的生效值（已被 scope 规则过滤）。
+
+    auto（默认）：多账号会共用时返回空串并 WARN 一次；
+    global：原样返回（运维显式自担风险）；off：一律空串。
+    """
+    scope = device_token_scope()
+    if scope == "off":
+        return ""
+    token = resolve_device_token(accounts_dir)
+    if not token or scope == "global":
+        return token
+    count = device_token_sharing_count(account, now=now)
+    if count > 1:
+        _warn_device_token_withheld(count)
+        return ""
     return token
 
 
@@ -747,11 +938,48 @@ DEGRADE_THRESHOLD = 5           # consecutive unknown failures before degrading
 DEGRADE_COOLDOWN = 600.0        # first degrade window: 10 minutes
 DEGRADE_COOLDOWN_MAX = 7200.0   # ... doubling up to 2 hours
 # 上游账号级风控限制（HTTP 403 / code 11140「账号存在异常行为，已被限制使用」）
-# 的冷却时长。上游按小时到工作日计：社区复盘里官方工单给的口径是「临时风控
+# 的冷却阶梯。上游按小时到工作日计：社区复盘里官方工单给的口径是「临时风控
 # 1-3 个工作日自动解除」，期间官方客户端同样报这个错，所以这不是内容审核、
-# 也不能靠换提示词或换号解决。取 2 小时作第一档，到期再试一次即可。
-# 与其它冷却不同，这个期限是**持久化**的（见 note_restricted）。
+# 也不能靠换提示词或换号解决。
+#
+# 这里从「固定 2 小时」改成**递增阶梯**（§B 审计 B-4）：固定 2 小时等于每 2 小时
+# 自动去撞一次上游，一天 12 次自证「这台设备还在打」，把一个本可自愈的标记养成
+# 持续异常。阶梯取 2h → 8h → 24h（封顶），三个档位的理由分别是：
+#   * 2h  —— 保留原来「撞了就等一小会儿再试」的手感，覆盖上游的瞬时限流；
+#   * 8h  —— 第二次命中说明 2 小时不够，退到「一个工作时段」的量级；
+#   * 24h —— 第三次起按「一天一次」，对齐官方口径的「1-3 个工作日」：既不每 2
+#             小时喂一次风控，也不因为一次误判把号永久钉死（每天仍有一次自愈
+#             机会，真正成功一次就回到第一档，见 note_success）。
+# 与其它冷却不同，这个期限是**持久化**的，连命中次数一起落盘（见 note_restricted）。
 RESTRICTED_ACCOUNT_COOLDOWN = 7200.0
+#: 阶梯倍数（相对 RESTRICTED_ACCOUNT_COOLDOWN）：2h → 8h → 24h。
+#: 用倍数而不是绝对秒数，是为了让调用方（wb_proxy 的 RESTRICTED_403_COOLDOWN、
+#: 本模块的 note_restriction_from_error）继续按老口径传 7200 也能吃到阶梯，
+#: 不必两处各写一份阶梯。
+RESTRICTED_COOLDOWN_STEPS = (1, 4, 12)
+#: 阶梯封顶：24 小时。
+RESTRICTED_COOLDOWN_MAX = 86400.0
+
+
+def restricted_backoff(hits, base=None):
+    """第 `hits` 次命中 11140 的冷却秒数：base × 阶梯倍数，封顶 24 小时。
+
+    base 缺省是 RESTRICTED_ACCOUNT_COOLDOWN；调用方传了自定义 cooldown 时按同一
+    组倍数放大——阶梯是「第几次命中」的函数，不是「固定多久」的常量。
+    """
+    base = RESTRICTED_ACCOUNT_COOLDOWN if base is None else base
+    try:
+        base = float(base)
+    except (TypeError, ValueError):
+        base = RESTRICTED_ACCOUNT_COOLDOWN
+    if base <= 0:
+        base = RESTRICTED_ACCOUNT_COOLDOWN
+    try:
+        count = max(1, int(hits))
+    except (TypeError, ValueError):
+        count = 1
+    step = RESTRICTED_COOLDOWN_STEPS[min(count, len(RESTRICTED_COOLDOWN_STEPS)) - 1]
+    return min(base * step, max(RESTRICTED_COOLDOWN_MAX, base))
 
 
 def _exponential_backoff(count, base, cap, offset):
@@ -930,6 +1158,21 @@ class Account(object):
         self.proxy_legacy = str(data.get("proxy") or "").strip()
         # Runtime-resolved value; recomputed by AccountPool.apply_proxy_slots().
         self.proxy = self.proxy_legacy
+        # 这个账号自己的 X-Device-Token（国内版 TuringShield 设备凭据）。
+        # 账号级 > settings 全局：设备凭据是「一台设备」的标识，多账号共用同一个值
+        # 等于在服务端把整批号 join 成一台机器——比不发这个头更糟（不发只是缺证据，
+        # 同值是把证据直接交上去）。所以能按账号配就一定按账号配。
+        # 非字符串一律当没配；值本身不 trim 以外的加工（token 是原样回传的）。
+        raw_device_token = data.get("deviceToken")
+        self.device_token = (raw_device_token.strip()
+                             if isinstance(raw_device_token, str) else "")
+        raw_device_token_file = data.get("deviceTokenFile")
+        self.device_token_file = (raw_device_token_file.strip()
+                                  if isinstance(raw_device_token_file, str) else "")
+        # 拥有这个账号的账号池，由 AccountPool.load()/add() 入池时回填、remove() 清掉。
+        # 只用来回答「这个号所在池里有几个号会共用全局 device token」——见
+        # device_token_sharing_count()。池外账号（单测 / 一次性探测）恒为 None。
+        self._owner_pool = None
         self.enabled = data.get("enabled", True)
         # Task participation is independent of API dispatch: an account can be
         # disabled for traffic but still run check-in / growth / travel / daily
@@ -989,6 +1232,13 @@ class Account(object):
             self.restricted_until = max(0.0, float(data.get("restrictedUntil") or 0))
         except (TypeError, ValueError):
             self.restricted_until = 0.0
+        # 这个号累计撞过几次 11140（递增阶梯用，见 restricted_backoff）。与
+        # restrictedUntil 同一份账号档：重启不清零，否则每次重启都回到 2 小时
+        # 第一档，阶梯等于不存在；只有真正成功一次（note_success）才清零。
+        try:
+            self.restricted_hits = max(0, int(data.get("restrictedHits") or 0))
+        except (TypeError, ValueError):
+            self.restricted_hits = 0
         # Per-model throttling. Upstream rate limits (code 6004 "usage exceeds
         # frequency limit") apply to ONE model for one account, not to the whole
         # account: other models keep working. Cooldown the offending model only,
@@ -1148,6 +1398,11 @@ class Account(object):
             "apiKey": bool(self.is_api_key),
             "proxySlot": self.proxy_slot,
             "proxy": self.proxy_legacy,
+            # 这个账号自己的设备凭据（国内版 X-Device-Token）。写进凭据档是为了
+            # 「每账号一台设备」能持久化；导出时会被 account_to_export() 摘掉，
+            # 详见那里的注释。
+            "deviceToken": self.device_token,
+            "deviceTokenFile": self.device_token_file,
             "enabled": self.enabled,
             "tasksEnabled": bool(self.tasks_enabled),
             "weight": self.weight,
@@ -1159,6 +1414,9 @@ class Account(object):
             # note_restricted）。导出的文档会带上它供查看，导入侧
             # normalise_import_row() 不认这个字段，换机器不会把账号一起停掉。
             "restrictedUntil": self.restricted_until,
+            # 命中次数一起落盘：阶梯是「第几次」的函数，丢了它重启就退回第一档
+            # （见 restricted_backoff）。同样不进导入侧，理由同上。
+            "restrictedHits": int(self.restricted_hits or 0),
             "credits": self.credits,
             # 账号档位（#505）。持久化：一天一次的计费摘要结论，重启后仍然
             # 有效；导入到另一台机器时按 VOLATILE_FIELDS 丢掉，不把上一台
@@ -1224,6 +1482,10 @@ class Account(object):
             "source": self.source,
             "apiKey": bool(self.is_api_key),
             "credentialMask": self.credential_mask(),
+            # 设备凭据只回显「配没配 / 从哪来」，值一律不回传（见 device_token_mask）。
+            "deviceTokenMask": self.device_token_mask(),
+            "deviceTokenSource": self.device_token_source(),
+            "deviceTokenScope": device_token_scope(),
             "proxySlot": self.proxy_slot,
             "proxy": self.proxy,
             "expiresAt": exp,
@@ -1293,6 +1555,28 @@ class Account(object):
         token = str(self.access_token or "")
         head = token.split(".", 1)[0]
         return (head + ".***") if head else "***"
+
+    def device_token_mask(self):
+        """面板可见的账号级设备凭据占位：配了就是 `***`，没配就是空串。
+
+        沿用 credential_mask() 的口径：连前几位都不回显——设备 token 是一串
+        原样回传的上游凭据，露出头部既足够在日志里定位，也足够让人以为面板能
+        拿回原值。面板只需要知道「这个号有没有自己的设备凭据」。
+        """
+        return "***" if (self.device_token or self.device_token_file) else ""
+
+    def device_token_source(self):
+        """账号级设备凭据的来源：`literal` / `file`；没配返回空串。
+
+        只回答「账号自己配了什么」，不回答「此刻会不会真的发出去」——后者取决于
+        全局值与 WB_DEVICE_TOKEN_SCOPE，是进程级事实，由面板的全局设置呈现，不在
+        每行账号上来回算（那会顺带触发 WARN 与设置读盘）。
+        """
+        if self.device_token:
+            return "literal"
+        if self.device_token_file:
+            return "file"
+        return ""
 
     def probe_api_key(self, timeout=15):
         """用企业额度端点验一次这个 Key 是否有效。
@@ -1697,6 +1981,10 @@ class Account(object):
                 streak = "（连续第 %d 次）" % self.soft_streak
             elif label.startswith("模型") and self.unscoped_streak > 1:
                 streak = "（连续第 %d 次）" % self.unscoped_streak
+            elif label == "上游风控限制" and int(self.restricted_hits or 0) > 1:
+                # 阶梯命中次数要看得见：看到「剩余 20 hours（第 3 次）」才知道
+                # 这个号已经进了 24 小时档，该去申诉而不是等下一次复探。
+                streak = "（第 %d 次）" % int(self.restricted_hits)
             return "%s 剩余 %s%s" % (label, _human_left(until - now), streak)
         if self.reserve_blocked():
             return "余额低于保留线"
@@ -1709,6 +1997,40 @@ class Account(object):
         exp = self.expires_at or jwt_exp(self.access_token)
         if exp and exp - now <= 120:
             return "凭证已过期"
+        return ""
+
+    def self_traffic_skip_reason(self, model=None):
+        """无人值守的自发出站（窗口探针 / 额度扫描）此刻该跳过的原因；空串=可以发。
+
+        这两条链路直接打 chat 端点、不经过派发侧的可用性判断，所以「账号已被
+        上游限制」过去完全挡不住它们：一个撞了 403 / 11140 的号还会被探针按固定
+        间隔继续打（§C 审计 P0-1）。这里给出一条与 `unavailable_reason()` 同源、
+        但**刻意更窄**的判据：
+
+        * 只认「再发一次只会继续喂风控」的状态：已停用 / 无凭证 / 凭证已过期 /
+          上游风控限制（restricted_until）/ 该模型被人工禁用。
+        * 软限流冷却、模型冷却、熔断、余额保护**故意不挡**。窗口探针的全部意义
+          就是在冷却到点后立刻抢占新一轮配额窗口，提前跳掉它等于让那条线继续
+          空转（`tests/_test_window_probe.py` 的
+          `test_successful_probe_clears_model_cooldown_only` 钉的正是这个语义：
+          账号级 cooldown 还在时探针必须照发）。区域级连坐暂停由调用方另行判
+          （`wb_proxy.restriction_hold_remaining`），因为它是 realm 级状态。
+        """
+        if not self.enabled:
+            return "已停用"
+        if not self.access_token:
+            return "无凭证"
+        if getattr(self, "token_expired", False):
+            return "凭证已过期"
+        if model and self.model_disabled(model):
+            return "该模型已被人工禁用"
+        try:
+            restricted = float(self.restricted_until or 0.0)
+        except (TypeError, ValueError):
+            restricted = 0.0
+        now = time.time()
+        if restricted > now:
+            return "上游风控限制 剩余 %s" % _human_left(restricted - now)
         return ""
 
     def model_disabled(self, model):
@@ -1800,6 +2122,12 @@ class Account(object):
         Shield 设备 token，国际版客户端则没有这个头（三轮抓包与 5.7.6 / 5.8.4
         二进制构造器都不含它）。发给国际版账号既是伪造头，也是把多个账号串到
         同一台设备的关联键（#448）。CLI 身份无论哪个区域都不发。
+
+        设备 token 的**取值来源**自 2026-10 起分两层（§B 审计 B-1）：
+        账号级 `deviceToken` / `deviceTokenFile` 优先，settings 的全局值只做兜底，
+        且全局值在「多个账号会共用它」时默认停用（见 `_device_token`、
+        `device_token_scope`）。理由：设备 token 是「一台设备」的凭据，全池共用
+        一个真实值等于把「这批号是同一台机器」直接写进上游数据库，比不发更糟。
 
         billing 标头仍带 X-Machine-ID / X-Session-ID，但两个都必须按账号派生：
         网关是一个进程冒充几十台设备，一旦取进程级的值，全部账号就会共用同一个
@@ -1894,11 +2222,40 @@ class Account(object):
         return headers
 
     def _device_token(self):
-        """Optional X-Device-Token from the configured literal or file."""
+        """这个账号此刻该发的 X-Device-Token；空串=不发。
+
+        取值顺序（2026-10 起，§B 审计 B-1）：
+        1. **账号级**（账号 JSON 的 `deviceToken` / `deviceTokenFile`）——只要配了
+           就只认它，永久放行；配坏了（文件不存在 / 超过 _DEVICE_TOKEN_MAX_BYTES）
+           就是这不发，**不回落**到全局值。设备凭据是「一台设备」的标识，按账号
+           配才谈得上「每账号一台设备」；字面量/文件都不需要 accounts_dir，所以
+           账号没有目录也能用。
+        2. **settings 全局**（`device_token` / `device_token_file`）——只是兜底：
+           `WB_DEVICE_TOKEN_SCOPE=auto`（默认）时，只有当本进程里「会用到全局值的
+           账号」不超过 1 个才真的发；多于一个就停用并 WARN 一次（只记一次）。
+           原因是全局值本质上是**一个真实设备**的凭据：N 个账号带着同一个
+           TuringShield token 出去，服务端拿这一列直接 join 就能把这批号认成
+           同一台机器——那比不发这个头糟得多（不发只是少了设备证据，同值是把
+           证据主动交上去，还顺带把「多账号」这件事钉死）。
+           `global` = 强行沿用旧行为（全池共用一个值，明确自担风险）；
+           `off` = 全局值一律不发（账号级不受影响——它们的意义就是替代全局值，
+           一个为了「别再共用」而加的开关不该顺手把「按账号配」也关掉）。
+        CLI 身份在调用方就被挡掉（官方 CLI 包里没有设备 token 逻辑），国际版 chat
+        也不发（#448）——两条口径都不在这里改。
+        """
+        if self.is_cli_identity():
+            return ""
+        if self.device_token or self.device_token_file:
+            # 账号自己配了设备凭据就只认它：配坏了（文件不存在 / 超限）就不发，
+            # **不回落**到全局值——运维已经把「这台设备」指定给这个号了，再悄悄
+            # 换成全池共用的那个值，等于把刚隔离开的设备指纹又接回去。同时也与
+            # device_token_sharing_count() 的计数口径一致（自备的号不占全局值）。
+            return resolve_account_device_token(self.device_token,
+                                                self.device_token_file)
         directory = getattr(self, "accounts_dir", "")
         if not directory:
             return ""
-        return resolve_device_token(directory)
+        return global_device_token(directory, account=self)
 
     def sync_nickname(self):
         """Manual web-console nickname refresh.
@@ -2547,6 +2904,7 @@ class Account(object):
                 detail = exc.read().decode("utf-8", "replace")
             except Exception:
                 detail = str(exc)
+            self.note_restriction_from_error(exc.code, detail)
             return None, {"message": "HTTP %d: %s" % (exc.code, detail[:120]),
                           "retryable": exc.code >= 500 or exc.code in (408, 429),
                           "limit": _active_conversation_limit(exc.code, detail)}
@@ -2583,6 +2941,35 @@ class Account(object):
         res = self._daily_chat_upstream(web)
         wb_activity.record_attempt(self, wb_activity.TASK_DAILY_CHAT, trigger, res)
         return res
+
+    #: 上游账号级风控限制的正文特征（HTTP 403 / code 11140）。与 wb_proxy 同一
+    #: 口径：code 用正则匹配，避免把 requestId 里的裸数字当成 11140；措辞只收
+    #: 实测的限制用语，不猜。
+    _RESTRICTED_BODY_RE = re.compile(r'"code"\s*:\s*"?11140"?')
+    _RESTRICTED_TEXT_MARKERS = ("账号存在异常行为", "unusual activity", "已被限制")
+
+    def note_restriction_from_error(self, status, text):
+        """任务链路撞到 11140 时落盘账号级限制；返回是否识别到。
+
+        签到 / 每日活跃 / 网页会话这些直连路径不走 wb_proxy.open_upstream，
+        过去撞 403 11140 只当普通失败返回，`restrictedUntil` 仍是 0——于是
+        调度器下一轮照样拿同一台设备上的号再撞一次，正是 #659 说的「加重
+        连坐」。账号级处置口径（`note_restricted`）本来就在本模块，这里只是
+        让它也能从直连路径被调用，与 API 派发路径对齐。
+        """
+        try:
+            if int(status or 0) != 403:
+                return False
+            blob = str(text or "")
+            if not (self._RESTRICTED_BODY_RE.search(blob)
+                    or any(m in blob for m in self._RESTRICTED_TEXT_MARKERS)):
+                return False
+            self.note_restricted(detail=blob, cooldown=RESTRICTED_ACCOUNT_COOLDOWN)
+            if self.path and os.path.exists(os.path.dirname(self.path)):
+                self.save(os.path.dirname(self.path))
+            return True
+        except Exception:
+            return False
 
     def _daily_chat_upstream(self, web=None):
         """每日活跃对话的实际流程；返回形状见 daily_chat。"""
@@ -2676,6 +3063,9 @@ class Account(object):
                 err = exc.read().decode("utf-8", "replace")
             except Exception:
                 err = str(exc)
+            # 403 / 11140 是账号级限制，不是本次任务失败：落盘冷却，让调度器
+            # 与手动补跑都不再拿这台「设备」去试探上游（#659）。
+            self.note_restriction_from_error(exc.code, err)
             return {"ok": False, "error": f"HTTP {exc.code}: {err[:100]}"}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -2717,6 +3107,9 @@ class Account(object):
         except urllib.error.HTTPError as exc:
             try:
                 raw_b = exc.read().decode("utf-8") or "{}"
+                # 国内版签到撞 403 / 11140 同样是账号级限制：先落盘冷却再解析
+                # 正文（正文可能不是 JSON，解析失败也不能漏掉这次处置）。
+                self.note_restriction_from_error(exc.code, raw_b)
                 body = json.loads(raw_b)
                 code = body.get("code")
                 msg = body.get("msg") or ("HTTP %d" % exc.code)
@@ -3301,6 +3694,13 @@ class Account(object):
         daily-activity tasks all land here, and without the lock two
         overlapping calls would each spend an upstream billing request and
         then race to publish whichever answer came back second.
+
+        这里**故意不做**上游受限判断（§B 审计 C5 的口径划分）：本函数同时是
+        手动入口（面板「刷新积分 / 刷新全部」、任务链），而手动是运维的明确动作，
+        允许它对受限号试一次——拦掉它，解封后就少了一条立刻把余额刷回来的路。
+        需要挡的是**无人值守**的自动刷新，那条入口是 `CreditsRefresher`，它用
+        `Account.self_traffic_skip_reason()` 在选号阶段就把受限号剔出去（见
+        `CreditsRefresher.stalest_account`）。
         """
         with self._credits_lock:
             res = self._fetch_credits_raw()
@@ -3382,7 +3782,7 @@ class Account(object):
             self.cooldown_until = time.time() + actual_cooldown
 
     def note_restricted(self, detail="", cooldown=None):
-        """上游账号级风控限制（403 / code 11140）：按小时冷却，且不随重启消失。
+        """上游账号级风控限制（403 / code 11140）：按阶梯冷却，且不随重启消失。
 
         实测正文：{"code":11140,"msg":"request illegal",...,"displayMsg":
         「账号存在异常行为，已被限制使用」}。官方客户端同样报这个错，说明是
@@ -3392,18 +3792,24 @@ class Account(object):
         否则设备指纹会连坐。
 
         与普通冷却的区别：
-        - 固定 2 小时（可用 cooldown 覆盖），不吃 single_account 的 3 秒兜底——
-          把被限制的账号每 3 秒再试一次，只会继续喂上游风控；
-        - 持久化到凭据档（restrictedUntil）：重启 / 刷新 token / 换身分 /
-          「一键测试」都不会把它清掉，只有真正成功一次（说明上游已解除）才清。
+        - **递增阶梯** 2h → 8h → 24h（封顶，见 restricted_backoff）：固定 2 小时
+          等于每 2 小时自动复探一次，把「临时风控」喂成持续异常。阶梯不吃
+          single_account 的 3 秒兜底——把被限制的账号每 3 秒再试一次只会更糟；
+        - 只有「上一轮已经到期」才算新的一次命中：同一窗口内的反复探测 / 重试
+          既不会把恢复时刻往后推，也不会白涨一档（`restrictedHits` 仅在真正
+          开启新窗口时 +1）。
+        - 持久化到凭据档（restrictedUntil / restrictedHits）：重启 / 刷新 token /
+          换身分 / 「一键测试」都不会把它清掉；只有真正成功一次（说明上游已
+          解除）才会清零计数并回到第一档（见 note_success）。
         """
         now = time.time()
-        wait = RESTRICTED_ACCOUNT_COOLDOWN if cooldown is None else float(cooldown)
         with self._throttle_lock:
             self.last_error = "HTTP 403 (account restricted)"
             self.last_error_detail = str(detail)[:2000] if detail else ""
-            # 第一次命中才起算：反复探测/重试不该把 2 小时越推越长。
+            # 第一次命中才起算：反复探测/重试不该让冷却越推越长，也不该白涨一档。
             if self.restricted_until <= now:
+                self.restricted_hits = int(self.restricted_hits or 0) + 1
+                wait = restricted_backoff(self.restricted_hits, cooldown)
                 self.restricted_until = now + max(1.0, wait)
         return self.restricted_until
 
@@ -3550,6 +3956,10 @@ class Account(object):
             self.breaker_until = 0.0
             self.degrade_until = 0.0
             self.restricted_until = 0.0
+            # 阶梯计数跟着一起归零：一次真正被上游服务的请求就是「已解封」的
+            # 证据，下一次再撞 11140 应当从 2 小时第一档重新起步，而不是接着
+            # 上一轮的历史直接判 24 小时（见 restricted_backoff）。
+            self.restricted_hits = 0
             self.last_error = ""
             self.last_error_detail = ""
             self.cooldown_until = 0.0
@@ -3828,12 +4238,44 @@ class CreditsRefresher(threading.Thread):
         self._lock = threading.Lock()
         self._parked = {}          # uid -> epoch until which we skip it
         self._failed_cooldown = 6 * 3600.0
+        #: uid -> 上一次记过日志的跳过原因。同一条原因只记一次：30 分钟一条、
+        #: 一天 48 条一模一样的「跳过」既没有信息量，还会把 40 行的环形缓冲冲掉。
+        self._skip_logged = {}
 
     def log(self, msg):
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         self.logs.append("[%s] %s" % (stamp, msg))
         if len(self.logs) > 40:
             self.logs = self.logs[-40:]
+
+    def auto_refresh_skip_reason(self, account):
+        """这个号此刻该跳过**自动**积分刷新的原因（空串=可以刷），顺手记一条日志。
+
+        判据只有一份，就是 `Account.self_traffic_skip_reason()`（已停用 / 无凭证 /
+        凭证过期 / 模型被人工禁用 / 上游风控限制）。这条后台链路是 C5 的暴露面：
+        它每 30 分钟一个 tick、一天最多 48 次计费请求，而它过去只过滤了
+        `enabled` / `access_token`——一个撞了 403 / 11140 的号会被它按表继续打，
+        等于每半小时替风控复探一次自己。
+
+        **只挡自动入口**。手动「刷新积分 / 刷新全部」走 `fetch_credits()` 本身，
+        不经过这里：那是运维的明确动作，允许它对受限号试一次（也是解封后能立刻
+        把余额刷回来的途径），见 `fetch_credits` 的注释。
+        """
+        checker = getattr(account, "self_traffic_skip_reason", None)
+        if checker is None:
+            # 测试桩 / 老对象没有这个判据：不改变原有行为。
+            return ""
+        try:
+            reason = str(checker() or "")
+        except Exception:
+            return ""
+        if not reason:
+            self._skip_logged.pop(account.uid, None)
+            return ""
+        if self._skip_logged.get(account.uid) != reason:
+            self._skip_logged[account.uid] = reason
+            self.log("跳过 %s 的积分自动刷新：%s" % (account.uid[:8], reason))
+        return reason
 
     def stop(self):
         self._stop_event.set()
@@ -3859,6 +4301,10 @@ class CreditsRefresher(threading.Thread):
 
         A balance that was never fetched counts as infinitely old, so a fresh
         install fills in its accounts before any timed-out one is revisited.
+
+        上游受限（11140）的账号不参与：它们的余额刷新没有意义，而每次尝试都是
+        一次「这台设备还在打」的自证。跳过它们之后，这一 tick 的预算会给到下一个
+        真正该刷的号，而不是白白浪费。判据见 `auto_refresh_skip_reason()`。
         """
         now = time.time() if now is None else now
         with self.pool._lock:
@@ -3867,6 +4313,9 @@ class CreditsRefresher(threading.Thread):
         chosen_age = None
         for account in accounts:
             if not account.enabled or not account.access_token:
+                continue
+            # C5：受限号（及其它「再发一次只会继续喂风控」的状态）一律不刷。
+            if self.auto_refresh_skip_reason(account):
                 continue
             if self._parked.get(account.uid, 0) > now:
                 continue
@@ -3890,6 +4339,10 @@ class CreditsRefresher(threading.Thread):
         with self._lock:
             account = self.stalest_account(ttl, now=now)
             if account is None:
+                return None
+            # 选号到取数之间状态可能已经变了（另一条链路刚记下 11140）：同一判据
+            # 再挡一次，别让这一 tick 白打一次计费接口。挡下不算失败，不 park。
+            if self.auto_refresh_skip_reason(account):
                 return None
             try:
                 result = account.fetch_credits()
@@ -3979,6 +4432,10 @@ class AccountPool(object):
         # uid 排序表的缓存：池成员没变就直接复用，变了重建（见 _page_ranks）。
         self._page_order_cache = None
         self.affinity = SessionAffinity()
+        # 池归属由**账号自己**记住（见 load()/add()）：全局 device token 该不该发，
+        # 取决于这个账号所在池里此刻有几个账号会用到它（device_token_sharing_count）。
+        # 不维护「当前池」这类进程级指针——同进程里还会临时建池（wb_proxy 读 realm
+        # 映射时每次都 new 一个 AccountPool），那种一次性池不该顶替主池的保护。
 
     def load(self):
         with self._lock:
@@ -3994,6 +4451,7 @@ class AccountPool(object):
                     self.log("account %s unreadable: %s" % (name, exc))
                     continue
                 if account.uid:
+                    account._owner_pool = self
                     self.accounts.append(account)
             self.apply_reserve_credits()
             self.apply_expiring_window()
@@ -4095,6 +4553,9 @@ class AccountPool(object):
                 self.accounts[self.accounts.index(existing)] = account
             else:
                 self.accounts.append(account)
+            # 入池即认主：全局 device token 的共享计数按「这个号在哪个池」来算
+            # （见 device_token_sharing_count），换池/新加的号都要重新绑。
+            account._owner_pool = self
             account.save(self.dir)
             self.apply_proxy_slots()
             self.apply_reserve_credits()
@@ -4107,6 +4568,9 @@ class AccountPool(object):
             if account is None: return False
             account.delete()
             self.accounts.remove(account)
+            # 出池就不再属于这个池：留在池外的号按「唯一使用者」算（count=1），
+            # 那是它被单独拿去做探测时的真实情形。
+            account._owner_pool = None
             return True
 
     def preview_import_rows(self, rows, realm=None, overwrite=False):
@@ -4509,8 +4973,18 @@ class AccountPool(object):
           does not pin, it rotates over one page of the pool (an (index, size)
           pair), so every account of the page keeps a warm copy without piling
           every oversized body onto a single account.
+
+        一条硬限制：**页只在它真的比可用账号数小时才轮转**。页大小 >= 可用号数
+        时，`_page_slice()` 会把整池都算进这一页（`size >= len(ranks)` 分支），
+        轮转就退化成「每轮换一个号」——一段对话被两个账号交替服务。这在只有
+        两个号的池子里是必然的（默认页大小是 3），代价是前缀缓存每轮归零，而
+        且把同一段对话同时留在两个号上（上游按会话内容聚类就能把两个号连起
+        来）。所以这种页按「钉住」处理：见 `_page_covers_the_pool()`。
         """
         exclude = exclude or set()
+        if session_key and page is not None and self._page_covers_the_pool(
+                realm, model, page):
+            page = None
         if session_key and page is None:
             for uid in self.affinity.recent(session_key):
                 if uid in exclude:
@@ -4537,6 +5011,43 @@ class AccountPool(object):
         if account and session_key and page is None:
             self.affinity.bind(session_key, account.uid)
         return account
+
+    def _page_covers_the_pool(self, realm, model, page):
+        """页大小 >= 这个 realm 此刻可用账号数？是则页就是整池，不该轮转。
+
+        「可用」按 `throttle_wait()` 判：它是纯时间算术（冷却 / 熔断 / 降权 /
+        余额保护 / 上游风控限制 / 模型冷却），与 `ready()` 的惩罚口径一致，但
+        不会顺手去刷新凭证——这条判断在每次派发上都要跑，不该带网络。
+
+        为什么需要：`_page_slice()` 在 `size >= len(ranks)` 时把整池当作这一页
+        （那是给"页比池子大"留的兜底），于是轮转退化成整池轮转、每次挑号都
+        进位一格。两个号的池子配上默认页大小 3 就必然踩这条——每轮换号。
+        这种情况返回 True，调用方把 page 置空、按普通对话钉住。
+        """
+        try:
+            size = int(page[1])
+        except (TypeError, ValueError, IndexError):
+            return False
+        if size <= 1:
+            # 页大小 1 由 affinity_route 直接折算成"钉住"，不是轮转。
+            return False
+        with self._lock:
+            snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+        usable = 0
+        for account in snapshot:
+            if not account.enabled or not account.access_token:
+                continue
+            try:
+                if account.throttle_wait(model=model) > 0:
+                    continue
+            except Exception:
+                continue
+            usable += 1
+        if usable <= 0:
+            # 一个能用的都没有：交给 pick()/上层报「没有可用账号」，不要把页
+            # 悄悄改成"钉住"。
+            return False
+        return usable <= size
 
     def pick(self, realm=None, exclude=None, model=None, page=None, allowed=None):
         exclude = exclude or set()
@@ -5153,11 +5664,21 @@ RUNTIME_ONLY_FIELDS = ("lastError", "cooldownUntil")
 
 
 def account_to_export(account):
-    """Serialise one account for an export document."""
+    """Serialise one account for an export document.
+
+    设备凭据（deviceToken）**不导出**：导出的文档会被人复制、贴进聊天、存到网盘，
+    而设备 token 是上游用来认「这台设备」的原样凭据；把它带到另一台机器上，正好
+    制造出「两台机器同一个设备指纹」——与「每账号一台设备」的口径相反，也和
+    restrictedUntil 一样属于「同一个设备 / 同一个位置的状态不该跨机器迁移」。
+    字段仍然保留（值为空串）并把来源标在 deviceTokenSource 里，重新导入后运维
+    一眼能看出「这个号原本自带设备凭据、需要在新机器上重配」。deviceTokenFile
+    是路径不是秘密，原样带过去：新机器上文件若在，凭据自然可用。
+    """
     data = account.to_dict()
     # Keep the credential and identity; drop nothing, but mark the file source
     # so a re-import on the same machine does not look like a desktop import.
     data.pop("path", None)
+    data["deviceToken"] = ""
     return data
 
 
