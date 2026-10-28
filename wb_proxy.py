@@ -10263,7 +10263,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.8.8",
+        "version": "1.8.9",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -12069,11 +12069,12 @@ SANITIZE_DSH_GUI_LOWER = "whose url the runtime context names"
 # any wording change, an inserted clause, reordering or merging also passes.
 # We only add one word (`that`) to sentence A, which preserves the meaning
 # verbatim and is idempotent via the negative lookahead.
+# 大小写要按原文保留：用捕获组 + 反向引用，而不是把整句替换成写死首字母大写的
+# 固定字符串。第一版（#683）就是固定字符串，输入小写会被改写；上游 835da5a 的
+# 配套用例 `test_case_insensitive` 钉的正是这一点，这里对齐上游写法。
 SANITIZE_DSH_FILEREF_RE = re.compile(
-    r"Tokens prefixed with @ are paths (?!that )the user explicitly referenced\.",
-    re.IGNORECASE)
-SANITIZE_DSH_FILEREF_REPLACEMENT = (
-    "Tokens prefixed with @ are paths that the user explicitly referenced.")
+    r"(?i)(Tokens prefixed with @ are paths )(?!that )(the user explicitly referenced\.)")
+SANITIZE_DSH_FILEREF_REPLACEMENT = r"\1that \2"
 SANITIZE_DSH_FILEREF_PROBE = "are paths the user explicitly referenced"
 # 品牌词缩减（#574）：`DeepSeek Harness` 单独出现放行，但它和 GUI 描述句
 # （`this page` / `this GUI` / `this app`）连续出现时命中同一套 11-128 校验。
@@ -19125,11 +19126,11 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    # 1.8.8 = 本地补丁版（非上游发版）：任务链路 403/11140 落盘 restrictedUntil
+    # 1.8.9 = 本地补丁版（非上游发版）：任务链路 403/11140 落盘 restrictedUntil
     # （wb_accounts.note_restriction_from_error）+ 调度错峰可配
     # （wb_scheduler.SCHEDULER_STAGGER_MIN/_MAX）。两处版本号必须一致，
     # tests/_test_release_engineering.py 钉着这一条。
-    server_version = "wb-proxy/1.8.8"
+    server_version = "wb-proxy/1.8.9"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
