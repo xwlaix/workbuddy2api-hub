@@ -16377,9 +16377,12 @@ def aggregate_stream(raw_iter, model, resp_id):
     saw_done = False
     for line in iter_sse_lines(raw_iter):
         data = strip_data_prefix(line.decode("utf-8", "replace"))
-        if not data or data == "[DONE]":
-            if data == "[DONE]":
-                saw_done = True
+        if data == "[DONE]":
+            saw_done = True
+            if os.environ.get("WB_STOP_AT_SSE_DONE", "").strip().lower() in ("1", "true", "yes", "on"):
+                break
+            continue
+        if not data:
             continue
         try:
             chunk = json.loads(data)
@@ -18647,9 +18650,12 @@ def stream_responses_events(upstream, model, holder):
         yield ev("response.in_progress", {"response": resp_obj("in_progress")})
     for raw in upstream:
         data = strip_data_prefix(raw.decode("utf-8", "replace"))
-        if not data or data == "[DONE]":
-            if data == "[DONE]":
-                saw_done = True
+        if data == "[DONE]":
+            saw_done = True
+            if os.environ.get("WB_STOP_AT_SSE_DONE", "").strip().lower() in ("1", "true", "yes", "on"):
+                break
+            continue
+        if not data:
             continue
         try:
             chunk = json.loads(data)
@@ -23596,7 +23602,11 @@ class Handler(BaseHTTPRequestHandler):
                 with heartbeat:
                     for line in iter_sse_lines(upstream, before_read=before_read):
                         data = strip_data_prefix(line.decode("utf-8", "replace"))
-                        if not data or data == "[DONE]" or data.startswith(":"):
+                        if data == "[DONE]":
+                            if os.environ.get("WB_STOP_AT_SSE_DONE", "").strip().lower() in ("1", "true", "yes", "on"):
+                                break
+                            continue
+                        if not data or data.startswith(":"):
                             continue
                         maybe = None
                         try:
