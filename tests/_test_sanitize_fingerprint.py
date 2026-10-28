@@ -210,66 +210,111 @@ class DshGuiParagraphTests(unittest.TestCase):
 
 
 class DshFileReferenceParagraphTests(unittest.TestCase):
-    """DSH 系统提示里文件引用说明段的渠道指纹。
+    """DSH 系统提示里「@ 文件引用说明段」的渠道指纹（#683 / 上游 835da5a）。
 
-    `@deepseek-ai/dsh-file-reference`（官方插件，packages/context/file-reference）
-    注入的 FILE_REFERENCE_PROMPT 里，这两句连续出现即命中 11-128，与 #570 的 GUI
-    段同一套「A 句 + B 句连续出现」判据：
+    DeepSeek Harness 的官方插件 `@deepseek-ai/dsh-file-reference`
+    （packages/context/file-reference）会往系统提示里注入 FILE_REFERENCE_PROMPT，
+    其中这两句连续出现即命中上游 11-128「不是官方客户端」判据（与 #570 的 GUI 段
+    同一套「A 句 + B 句连续出现」规则）：
 
         A: Tokens prefixed with @ are paths the user explicitly referenced.
         B: Relative paths resolve from the workspace root; absolute paths identify
            files or directories on the host.
 
     2026-10-28 二分实测（稳定复现 3/3）：A 单独 200、B 单独 200、A+B 连续 400；
-    改 A 措辞 / 改 B 措辞 / 两句之间插一句话 / 换序 / 合并成一句，全部 200；
+    改 A 措辞 / 改 B 措辞 / 中间插一句 / 换序 / 合并成一句，全部 200；
     只把 B 的 `absolute` 换成 `full` 无效（说明不是单词级匹配）。
-    这里只在 A 句补一个 `that` —— 一个词不多不少，语义完全不变。
+    整段五句连排也稳定 400，而整段里 A 句补一个 `that` 就 200 —— 所以匹配单位是
+    **整段连续文本**，只在 A 句补一个词（语义完全不变）就能让它失配，B 句及其后
+    所有句子原样保留；负向前瞻 (?!that ) 保证幂等。
+    作用域与 GUI 段同口径：system / developer / assistant 改写，user / tool 里的
+    同句属用户数据不改写（#537）。
+
+    合并说明：历史上这里有两个同名类（我们的 #683 与上游 835da5a 各写了一份），
+    Python 里后定义的会把前一个覆盖掉，导致先定义那 9 条测试静默不执行。
+    现在合成一个类，两边的断言（消息级作用域、整段边界、端到端出站 body）都在。
     """
 
-    A = ("Tokens prefixed with @ are paths the user explicitly referenced.")
-    A_REWORDED = ("Tokens prefixed with @ are paths that the user explicitly "
-                  "referenced.")
+    A = "Tokens prefixed with @ are paths the user explicitly referenced."
+    A_FIXED = "Tokens prefixed with @ are paths that the user explicitly referenced."
     B = ("Relative paths resolve from the workspace root; absolute paths identify "
          "files or directories on the host.")
-    FILEREF = A + " " + B
+    TAIL = (" A trailing slash marks a directory: list it when its contents matter. "
+            "Anything else is a file: use the read tool when its contents are needed, "
+            "and do not claim to have inspected it before reading. "
+            "@\"...\" quotes a path containing spaces.")
+    FILEREF = A + " " + B                 # 命中判据的最小单元（A+B 连续）
+    PARA = A + " " + B + TAIL             # 真实注入的整段（五句）
+    PARA_FIXED = A_FIXED + " " + B + TAIL
 
+    # ---- 整段边界
+    def test_full_paragraph_rewritten(self):
+        self.assertEqual(P.sanitize_text(self.PARA), self.PARA_FIXED)
+
+    def test_only_sentence_a_changes(self):
+        # B 句及其后所有句子必须逐字保留：改的是措辞，不是内容。
+        out = P.sanitize_text(self.PARA)
+        self.assertIn(self.B + self.TAIL, out)
+        self.assertNotIn(" are paths the user ", out)
+
+    def test_embedded_in_system_prompt(self):
+        text = "You are a coding agent.\n\n" + self.PARA + "\n\nMore rules follow."
+        self.assertEqual(
+            P.sanitize_text(text),
+            "You are a coding agent.\n\n" + self.PARA_FIXED + "\n\nMore rules follow.")
+
+    # ---- 消息级作用域
     def test_file_reference_paragraph_in_system_rewritten(self):
         out = P.sanitize_messages([{"role": "system", "content": self.FILEREF}])
-        self.assertEqual(out[0]["content"], self.A_REWORDED + " " + self.B)
+        self.assertEqual(out[0]["content"], self.A_FIXED + " " + self.B)
 
     def test_file_reference_paragraph_in_developer_rewritten(self):
         out = P.sanitize_messages([{"role": "developer", "content": self.FILEREF}])
-        self.assertEqual(out[0]["content"], self.A_REWORDED + " " + self.B)
+        self.assertEqual(out[0]["content"], self.A_FIXED + " " + self.B)
 
     def test_file_reference_paragraph_in_assistant_rewritten(self):
         # assistant 历史同样被 #574 确认会触发，规则一并覆盖。
         out = P.sanitize_messages([{"role": "assistant", "content": self.FILEREF}])
-        self.assertEqual(out[0]["content"], self.A_REWORDED + " " + self.B)
+        self.assertEqual(out[0]["content"], self.A_FIXED + " " + self.B)
 
-    def test_user_and_tool_untouched(self):
-        # user / tool 里的同句属用户数据，按 #537 口径不改写。
+    def test_scoped_to_system_developer_and_assistant(self):
         out = P.sanitize_messages([
-            {"role": "user", "content": self.FILEREF},
-            {"role": "tool", "content": self.FILEREF},
+            {"role": "system", "content": self.PARA},
+            {"role": "developer", "content": self.PARA},
+            {"role": "assistant", "content": self.PARA},
+            {"role": "user", "content": self.PARA},
+            {"role": "tool", "content": self.PARA},
         ])
-        self.assertEqual(out[0]["content"], self.FILEREF)
-        self.assertEqual(out[1]["content"], self.FILEREF)
+        for i in range(3):
+            self.assertEqual(out[i]["content"], self.PARA_FIXED, out[i]["role"])
+        # user / tool 里的同句是用户数据，改写会让模型看到与磁盘不一致的内容。
+        self.assertEqual(out[3]["content"], self.PARA)
+        self.assertEqual(out[4]["content"], self.PARA)
 
-    def test_sentence_a_alone_also_rewritten(self):
-        # 只补一个 that、语义不变，所以单独出现时改写同样安全；
-        # 不必依赖 B 句同时在场（B 的变体不该让规则失效）。
-        out = P.sanitize_text(self.A)
-        self.assertEqual(out, self.A_REWORDED)
+    # ---- 单句 / 幂等 / 大小写
+    def test_sentence_a_alone_rewritten(self):
+        # A 句单独出现时改写同样安全（只补一个词），不必等 B 句在场；
+        # 这样 DSH 换掉后半段措辞也不会让规则失效。
+        self.assertEqual(P.sanitize_text(self.A), self.A_FIXED)
 
     def test_idempotent(self):
-        once = P.sanitize_text(self.FILEREF)
-        twice = P.sanitize_text(once)
-        self.assertEqual(once, twice)
-        self.assertEqual(twice.count("paths that the user"), 1)
+        for src, fixed in ((self.FILEREF, self.A_FIXED + " " + self.B),
+                           (self.PARA, self.PARA_FIXED)):
+            once = P.sanitize_text(src)
+            self.assertEqual(once, fixed)
+            self.assertEqual(P.sanitize_text(once), once)
+            self.assertEqual(once.count("paths that the user"), 1)
+            self.assertFalse(P.has_fingerprint(once))
 
     def test_case_insensitive(self):
-        out = P.sanitize_text(self.FILEREF.lower())
-        self.assertIn("paths that the user", out.lower())
+        # 反向引用保留原文大小写：改写的是"补词"，不是整句重写。
+        self.assertEqual(P.sanitize_text(self.PARA.lower()), self.PARA_FIXED.lower())
+
+    # ---- 不该动的东西
+    def test_unrelated_at_paths_untouched(self):
+        for text in ("mail me at foo@bar.com", "npm i @deepseek-ai/dsh",
+                     "see C:\\work\\@cache for details"):
+            self.assertEqual(P.sanitize_text(text), text)
 
     def test_unrelated_text_untouched(self):
         for text in (
@@ -279,6 +324,7 @@ class DshFileReferenceParagraphTests(unittest.TestCase):
         ):
             self.assertEqual(P.sanitize_text(text), text, text)
 
+    # ---- 端到端
     def test_wire_body_carries_the_rewrite(self):
         # 走完整链路再断言一次：规则接上了还不够，得确认 build_upstream_body
         # 真的用它构造出站 body（漏接时单测全绿、线上照旧 400）。
@@ -389,86 +435,6 @@ class IdentityVerbVariantsTests(unittest.TestCase):
         self.assertEqual(out[0]["content"], self.CLEAN)
         self.assertEqual(out[1]["content"], self.CLEAN)
         self.assertEqual(out[2]["content"], fp)
-
-
-class DshFileReferenceParagraphTests(unittest.TestCase):
-    """DSH 系统提示里「@ 文件引用说明段」的渠道指纹。
-
-    DeepSeek Harness 的官方插件 `@deepseek-ai/dsh-file-reference`
-    （packages/context/file-reference）会往系统提示里注入 FILE_REFERENCE_PROMPT。
-    这一段被上游当成「非官方客户端」的特征，回 400 / code 11-128
-    （displayTips：这次调用没通过渠道校验）。
-
-    2026-10-28 在本机 CN 号池实测，用来定指纹边界（不是猜）：
-
-        · 只发 A+B 两句 → 200
-        · 整段五句连排 → 400，稳定复现
-        · 整段里 A 句补一个 `that` → 200
-
-    也就是说匹配单位是**整段连续文本**：截前两句测会误判成「已修复」，
-    改 A 句一个词就能让它失配。修法因此取最小改动——只在 A 句补一个 `that`，
-    一个词不多不少，B 句及其后所有句子原样保留，语义完全不变；负向前瞻
-    (?!that ) 保证幂等。作用域与 GUI 段同口径：system / developer / assistant，
-    user / tool 里的同句属用户数据不改写（#537）。
-    """
-
-    A = "Tokens prefixed with @ are paths the user explicitly referenced."
-    A_FIXED = "Tokens prefixed with @ are paths that the user explicitly referenced."
-    B = ("Relative paths resolve from the workspace root; absolute paths identify "
-         "files or directories on the host.")
-    TAIL = (" A trailing slash marks a directory: list it when its contents matter. "
-            "Anything else is a file: use the read tool when its contents are needed, "
-            "and do not claim to have inspected it before reading. "
-            "@\"...\" quotes a path containing spaces.")
-    PARA = A + " " + B + TAIL
-    PARA_FIXED = A_FIXED + " " + B + TAIL
-
-    def test_full_paragraph_rewritten(self):
-        self.assertEqual(P.sanitize_text(self.PARA), self.PARA_FIXED)
-
-    def test_only_sentence_a_changes(self):
-        # B 句及其后所有句子必须逐字保留：改的是措辞，不是内容。
-        out = P.sanitize_text(self.PARA)
-        self.assertIn(self.B + self.TAIL, out)
-        self.assertNotIn(" are paths the user ", out)
-
-    def test_idempotent(self):
-        once = P.sanitize_text(self.PARA)
-        self.assertEqual(P.sanitize_text(once), once)
-        self.assertFalse(P.has_fingerprint(once))
-
-    def test_sentence_a_alone_rewritten(self):
-        # A 句单独出现时改写同样安全（只补一个词），不必等 B 句在场；
-        # 这样 DSH 换掉后半段措辞也不会让规则失效。
-        self.assertEqual(P.sanitize_text(self.A), self.A_FIXED)
-
-    def test_case_insensitive(self):
-        self.assertEqual(P.sanitize_text(self.PARA.lower()), self.PARA_FIXED.lower())
-
-    def test_embedded_in_system_prompt(self):
-        text = "You are a coding agent.\n\n" + self.PARA + "\n\nMore rules follow."
-        self.assertEqual(
-            P.sanitize_text(text),
-            "You are a coding agent.\n\n" + self.PARA_FIXED + "\n\nMore rules follow.")
-
-    def test_scoped_to_system_developer_and_assistant(self):
-        out = P.sanitize_messages([
-            {"role": "system", "content": self.PARA},
-            {"role": "developer", "content": self.PARA},
-            {"role": "assistant", "content": self.PARA},
-            {"role": "user", "content": self.PARA},
-            {"role": "tool", "content": self.PARA},
-        ])
-        for i in range(3):
-            self.assertEqual(out[i]["content"], self.PARA_FIXED, out[i]["role"])
-        # user / tool 里的同句是用户数据，改写会让模型看到与磁盘不一致的内容。
-        self.assertEqual(out[3]["content"], self.PARA)
-        self.assertEqual(out[4]["content"], self.PARA)
-
-    def test_unrelated_at_paths_untouched(self):
-        for text in ("mail me at foo@bar.com", "npm i @deepseek-ai/dsh",
-                     "see C:\\work\\@cache for details"):
-            self.assertEqual(P.sanitize_text(text), text)
 
 
 if __name__ == "__main__":

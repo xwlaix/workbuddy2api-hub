@@ -213,9 +213,11 @@ th.sortable:focus-visible .sort-arrow.idle{opacity:1}
 /* 中屏（641–960px）：桌面表格布局还在，但横向空间有限。固定 px 的说明上限
    在这个区间最挤——一条 429 原文能把「账号」压到贴着「时间」。这里把说明列
    收到 300px（行内 max-width 优先级更高，须 !important 才盖得住）；表格下限
-   720px 不动，摆不下仍横向滚动，列宽不会被压扁。账号列的 160px 上限不动。 */
+   720px 不动，摆不下仍横向滚动，列宽不会被压扁。账号列的 160px 上限不动。
+   选择器用 data-col 而不是 data-label：i18n 会把 data-label 就地翻成英文 /
+   繁中（见本文件顶部 doAttrs 的说明），用中文 label 选择器一切语言就失效。 */
 @media (min-width:641px) and (max-width:960px){
-  td[data-label="说明"] .note-clip{max-width:300px!important}
+  td[data-col="note"] .note-clip{max-width:300px!important}
 }
 /* 手机卡片模式（≤640px）：每格独占一行，折行显示全文，不再省略号截断
    （完整内容本来也在 title 里，但触屏没有 hover，截断了就看不全）。 */
@@ -226,12 +228,17 @@ th.sortable:focus-visible .sort-arrow.idle{opacity:1}
 /* 活动表的短标签列（时间/区域/任务/来源/结果）不许逐字折行：表格自动布局
    里说明列一挤，这些列会被压到一字宽——「国际版每日活跃」变成一字一行的
    竖条，行高撑到七八行。nowrap 给布局一个真实下限（列至少要放得下标签），
-   宽度不够时整表横向滚动，而不是把标签竖起来；说明列仍是弹性吸收方。 */
-table.activity-table td[data-label="时间"],
-table.activity-table td[data-label="区域"],
-table.activity-table td[data-label="任务"],
-table.activity-table td[data-label="来源"],
-table.activity-table td[data-label="结果"]{white-space:nowrap}
+   宽度不够时整表横向滚动，而不是把标签竖起来；说明列仍是弹性吸收方。
+   用 data-col：data-label 会被 i18n 翻译成英文 / 繁中，切语言后这些规则会
+   静默失效（td 里另存一份不变的 data-col 专供样式与测试用）。
+   注：本文件早期还有 8 条同类规则仍用 data-label（account-cards 的「账号」「积分」、
+   data-cards 的「启用」、modelsTable 的「思考档位」「默认采样参数」），切语言同样
+   失效；那是历史写法，修它们要同步给 9 处渲染模板加 data-col，留作单独一批。 */
+table.activity-table td[data-col="time"],
+table.activity-table td[data-col="realm"],
+table.activity-table td[data-col="task"],
+table.activity-table td[data-col="source"],
+table.activity-table td[data-col="result"]{white-space:nowrap}
 #recent table th, #recent table td{text-align:center}
 #recent table th:first-child, #recent table td:first-child{text-align:center}
 #recent table td.mono{font-variant-numeric:tabular-nums}
@@ -8426,21 +8433,21 @@ function activityHistoryRow(row){
   const trigger = ACTIVITY_TRIGGERS[row && row.trigger] || '';
   const message = String((row && row.message) || '');
   return '<tr>'
-    + '<td class="mono" data-label="时间">'
+    + '<td class="mono" data-label="时间" data-col="time">'
     +   esc(String((row && row.ts) || '').replace('T', ' ').slice(0, 19)) + '</td>'
-    + '<td data-label="账号">' + esc(nick)
+    + '<td data-label="账号" data-col="account">' + esc(nick)
     +   (uid ? '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(uid.slice(0, 8)) + '</div>' : '')
     + '</td>'
-    + '<td data-label="任务">' + esc(task)
+    + '<td data-label="任务" data-col="task">' + esc(task)
     +   (trigger ? '<div style="color:var(--dim);font-size:11px">' + esc(trigger) + '</div>' : '')
     + '</td>'
-    + '<td data-label="结果">'
+    + '<td data-label="结果" data-col="result">'
     +   (row && row.ok ? '<span class="badge ok">成功</span>' : '<span class="badge bad">失败</span>')
     + '</td>'
     // 上游原文可能很长：在 span 上做行内截断（td 自身不吃 max-width），完整
     // 内容留在 title 里，模态框不会被撑宽。.note-clip 与账号页活动表共用分档
     // 上限（中屏 300px），手机上由 640px 断点改折行。
-    + '<td data-label="说明" style="text-align:left">'
+    + '<td data-label="说明" data-col="note" style="text-align:left">'
     +   '<span class="note-clip" style="max-width:420px"'
     +   ' title="' + esc(message) + '">' + esc(message || '—') + '</span></td>'
     + '</tr>';
@@ -8960,21 +8967,21 @@ function renderActivityBoard(data){
     + '<th style="text-align:left">说明</th>'
     + '</tr></thead><tbody>'
     + rows.map(r => '<tr>'
-        + '<td class="mono" data-label="时间">' + esc(activityTime(r.ts)) + '</td>'
-        + '<td data-label="账号" title="' + esc(r.uid || '') + '">'
+        + '<td class="mono" data-label="时间" data-col="time">' + esc(activityTime(r.ts)) + '</td>'
+        + '<td data-label="账号" data-col="account" title="' + esc(r.uid || '') + '">'
           + '<span class="note-clip" style="max-width:160px" title="'
           + esc(activityWho(r)) + '" data-no-i18n>' + esc(activityWho(r)) + '</span></td>'
-        + '<td style="text-align:center" data-label="区域">'
+        + '<td style="text-align:center" data-label="区域" data-col="realm">'
           + esc(ACTIVITY_REALM_LABEL[r.realm] || '—') + '</td>'
-        + '<td data-label="任务">' + esc(ACTIVITY_TASK_LABEL[r.task] || r.task || '—') + '</td>'
-        + '<td style="text-align:center" data-label="来源">'
+        + '<td data-label="任务" data-col="task">' + esc(ACTIVITY_TASK_LABEL[r.task] || r.task || '—') + '</td>'
+        + '<td style="text-align:center" data-label="来源" data-col="source">'
           + esc(ACTIVITY_TRIGGER_LABEL[r.trigger] || r.trigger || '—') + '</td>'
-        + '<td style="text-align:center" data-label="结果">' + resultBadge(r.ok) + '</td>'
+        + '<td style="text-align:center" data-label="结果" data-col="result">' + resultBadge(r.ok) + '</td>'
         // 上游原文可能很长：在 span 上做行内截断（td 自身不吃 max-width，撑宽的是
         // 整张表），完整内容留在 title 里，表格不会被一条 429 原文拉出横向滚动。
         // 上限分档给（.note-clip）：大屏 520px，中屏 641–960px 桌面布局还在但
         // 宽度有限，收到 300px，免得账号贴着时间；手机卡片模式下改折行显示全文。
-        + '<td data-label="说明" style="text-align:left">'
+        + '<td data-label="说明" data-col="note" style="text-align:left">'
         +   (r.message
               ? '<span class="note-clip" style="max-width:520px" title="' + esc(r.message) + '">' + esc(r.message) + '</span>'
               : '<span style="color:var(--dim)">—</span>')
