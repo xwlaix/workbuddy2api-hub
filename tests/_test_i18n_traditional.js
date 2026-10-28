@@ -158,4 +158,19 @@ check(urlWins.htmlEl.getAttribute('lang') === 'en', 'URL 覆蓋時 html lang 應
 const instEn = makeHarness(null, 'en');
 check(instEn.win.WB_I18N.current() === 'en', '沒有本機偏好時應使用實例預設 en');
 
+// CSS 选择器不许依赖 i18n 会改写的属性。
+// doAttrs() 会把 ATTRS = title / placeholder / aria-label / data-label / alt 的
+// 值就地翻译成英文或繁中，用它们做选择器的规则会在切语言后静默失效——#683 的
+// 文件引用段说明列上限、活动表 nowrap 都踩过这个坑。样式请用 data-col 这类
+// 不会被 i18n 改写的稳定属性定位。
+// 全文扫而不是切 <style>：样式块不保证只有一块，且 querySelector 里同样会踩。
+// 只查「带值」的属性选择器（`[data-label="x"]`、`[title^="x"]` 等）：
+// 裸的 `[data-label]` 判的是"有没有这个属性"，与取值无关，i18n 改写不影响它。
+for (const attr of ['title', 'placeholder', 'aria-label', 'data-label', 'alt']) {
+  const loose = new RegExp('\\[\\s*' + attr + '\\s*[~|^$*]?=', 'g');
+  const hits = html.match(loose) || [];
+  check(hits.length === 0,
+        'CSS/选择器里不许用 [' + attr + '=]（i18n 会改写它的值）: ' + hits.join(' '));
+}
+
 console.log(`traditional chinese i18n assertions passed (${checks} checks)`);

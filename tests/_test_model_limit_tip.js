@@ -156,7 +156,7 @@ const rowHtml = api.accountRow(Object.assign({}, acctBase, {
   modelDailyTokenLimit: 200000000,
   modelDailyTokens: {[MODEL]: 201000000},
 }));
-const accountCell = rowHtml.match(/<td style="text-align:left" data-label="账号">([\s\S]*?)<\/td>\s*<td style="text-align:center" data-label="状态">/);
+const accountCell = rowHtml.match(/<td style="text-align:left" data-label="账号"(?: data-col="[^"]*")?>([\s\S]*?)<\/td>\s*<td style="text-align:center" data-label="状态">/);
 check('账号列里已无胶囊', accountCell && !/cool-pill/.test(accountCell[1]),
   accountCell && accountCell[1].slice(-120));
 check('账号行仍以 </tr> 收尾，新行紧跟其后',
@@ -335,7 +335,8 @@ check('窄屏整行左对齐规则存在', posLeft > 0);
 check('左对齐写在 td[colspan] 居中之后（次序对才生效）',
       posCenter > 0 && posLeft > posCenter, 'center=' + posCenter + ' left=' + posLeft);
 // 账号列那列的 ellipsis 要留着：那一列确实放不下，别被顺手动坏
-const acctPillAt = cssStyle.indexOf('table.account-cards td[data-label="账号"] .cool-pill{');
+// 选择器用 data-col（data-label 会被 i18n 改写，样式里不许依赖它）
+const acctPillAt = cssStyle.indexOf('table.account-cards td[data-col="account"] .cool-pill{');
 check('账号列胶囊仍保留 ellipsis（该列确实放不下）',
       acctPillAt >= 0 && /text-overflow\s*:\s*ellipsis/.test(
         cssStyle.slice(acctPillAt, cssStyle.indexOf('}', acctPillAt))));

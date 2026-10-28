@@ -6,7 +6,7 @@ const html = dashboardHtml();
 const script = dashboardScript();
 
 assert.ok(/\.cool-list\{display:flex;flex-direction:column/.test(html), '账号告警应纵向排列');
-assert.ok(/table\.account-cards td\[data-label="账号"\] \.cool-pill\{display:block;width:100%/.test(html), '告警 pill 应在账号列内收敛');
+assert.ok(/table\.account-cards td\[data-col="account"\] \.cool-pill\{display:block;width:100%/.test(html), '告警 pill 应在账号列内收敛');
 assert.ok(/\.acct-actions-row\{flex-wrap:nowrap;max-width:none\}/.test(html), '桌面操作区应保持原来的两行紧凑布局');
 assert.ok(/table\.account-cards\{table-layout:fixed;min-width:1262px\}/.test(html), '桌面账号表应使用固定布局');
 assert.ok(/td\.acct-actions\{white-space:normal;min-width:232px;width:232px;position:sticky/.test(html), '操作列应固定在可视区域右侧');

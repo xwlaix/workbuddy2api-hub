@@ -160,9 +160,9 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 /* 消费倍率列可能同时放「倍率」和「Pro Only」两枚胶囊；固定列宽下
    nowrap 会把第二枚裁掉，允许换行只让这一类行变高（#527）。 */
 #modelsTable td.rate-cell{white-space:normal;line-height:1.8}
-#modelsTable td[data-label="思考档位"]{white-space:nowrap}
+#modelsTable td[data-col="effort"]{white-space:nowrap}
 /* 采样参数：放不下时 chips 折行显示完整，不截断 */
-#modelsTable td[data-label="默认采样参数"]{white-space:normal}
+#modelsTable td[data-col="sampling"]{white-space:normal}
 /* 模型 ID 前的「一键配置」勾选框。勾选只决定一键配置写进客户端的模型清单，
    不改网关路由；label 把勾选框和 ID 包在一起，点 ID 也能勾。排序只认表头
    （见 sortHeaderAt），点勾选框不会触发排序。单元格用类名定位，别用
@@ -231,9 +231,10 @@ th.sortable:focus-visible .sort-arrow.idle{opacity:1}
    宽度不够时整表横向滚动，而不是把标签竖起来；说明列仍是弹性吸收方。
    用 data-col：data-label 会被 i18n 翻译成英文 / 繁中，切语言后这些规则会
    静默失效（td 里另存一份不变的 data-col 专供样式与测试用）。
-   注：本文件早期还有 8 条同类规则仍用 data-label（account-cards 的「账号」「积分」、
-   data-cards 的「启用」、modelsTable 的「思考档位」「默认采样参数」），切语言同样
-   失效；那是历史写法，修它们要同步给 9 处渲染模板加 data-col，留作单独一批。 */
+   全文件已统一到这个口径：account-cards 的「账号」「积分」、data-cards 的「启用」、
+   modelsTable 的「思考档位」「默认采样参数」也都换成了 data-col。唯一保留的
+   `td:not([data-label])` 是"有没有这个属性"的存在性判断，与取值无关，不受 i18n 影响。
+   tests/_test_i18n_traditional.js 钉住了这条不变量：样式里出现 [属性=] 就红。 */
 table.activity-table td[data-col="time"],
 table.activity-table td[data-col="realm"],
 table.activity-table td[data-col="task"],
@@ -288,8 +289,8 @@ table.activity-table td[data-col="result"]{white-space:nowrap}
 .cool-pill{display:inline-block;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;padding:1px 7px;border-radius:999px;font-size:10px;font-weight:600;
   color:#a0691c;background:rgba(183,121,31,.14);border:1px solid rgba(183,121,31,.35);white-space:nowrap}
 /* 桌面账号表的告警按模型逐条纵排；完整模型名/时间仍可通过 title 悬浮查看。 */
-table.account-cards td[data-label="账号"] .cool-list{display:flex;flex-direction:column;align-items:stretch;gap:2px;max-width:100%;overflow:hidden}
-table.account-cards td[data-label="账号"] .cool-pill{display:block;width:100%;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+table.account-cards td[data-col="account"] .cool-list{display:flex;flex-direction:column;align-items:stretch;gap:2px;max-width:100%;overflow:hidden}
+table.account-cards td[data-col="account"] .cool-pill{display:block;width:100%;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 @media (min-width:641px){
   table.account-cards{table-layout:fixed;min-width:1262px}
   table.account-cards th:nth-child(2),table.account-cards td:nth-child(2){width:180px}
@@ -303,7 +304,7 @@ table.account-cards td[data-label="账号"] .cool-pill{display:block;width:100%;
 @media (max-width:640px){
   table.account-cards{min-width:0!important;table-layout:auto}
   table.account-cards th:last-child,table.account-cards td.acct-actions{position:static;min-width:0;width:auto;z-index:auto;box-shadow:none}
-  table.account-cards td[data-label="积分"]{white-space:normal;align-items:flex-start}
+  table.account-cards td[data-col="credit"]{white-space:normal;align-items:flex-start}
   table.account-cards .credit-stack{width:100%;align-items:flex-start}
 }
 .empty{color:var(--dim);text-align:center;padding:28px 0;font-size:13px}
@@ -368,9 +369,9 @@ button.mini{padding:3px 9px;font-size:11px}
   padding:3px 6px;color:var(--fg);font:inherit;font-size:11px;font-variant-numeric:tabular-nums}
 .slot-input{width:100%;background:var(--panel2);border:1px solid var(--line);
   border-radius:8px;padding:6px 10px;color:var(--fg);font:inherit;font-size:13px}
-table.account-cards td[data-label="账号"]{padding-top:6px;padding-bottom:6px}
-table.account-cards td[data-label="账号"] .cool-list{max-width:100%;}
-table.account-cards td[data-label="账号"] .cool-pill{max-width:100%;overflow:hidden;text-overflow:ellipsis}
+table.account-cards td[data-col="account"]{padding-top:6px;padding-bottom:6px}
+table.account-cards td[data-col="account"] .cool-list{max-width:100%;}
+table.account-cards td[data-col="account"] .cool-pill{max-width:100%;overflow:hidden;text-overflow:ellipsis}
 /* 冷却 / 达日限额的整行（coolRow / limitRow）：跨满表头列数，文本完整可见，
    不再有省略号，所以也不再需要 title 兜底。桌面下表格用 table-layout:fixed，
    td 是普通单元格，只要去掉 ::before 的 data-label 装饰即可；窄屏走
@@ -844,8 +845,8 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
   #pageSettings section > div[style*="display:flex"]{flex-wrap:wrap}
   #pageSettings input:not([type=checkbox]), #pageSettings select{min-height:40px;font-size:13px}
   #pageSettings .slot-input{font-size:13px}
-  table.data-cards td[data-label="启用"]{justify-content:space-between}
-  table.data-cards td[data-label="启用"] input[type=checkbox]{width:20px;height:20px}
+  table.data-cards td[data-col="enabled"]{justify-content:space-between}
+  table.data-cards td[data-col="enabled"] input[type=checkbox]{width:20px;height:20px}
   /* Logs */
   #logTerminalBody{height:60vh!important}
   #pageLogs .toolbar{display:grid;grid-template-columns:1fr 1fr;gap:6px}
@@ -6829,7 +6830,7 @@ function renderAvailableModels(){
     const samples = [];
     if(m.temperature != null) samples.push('温度 ' + esc(String(m.temperature)));
     if(m.top_p != null) samples.push('top_p ' + esc(String(m.top_p)));
-    const sampleCell = '<td style="text-align:left;padding-right:14px" data-label="默认采样参数">'
+    const sampleCell = '<td style="text-align:left;padding-right:14px" data-label="默认采样参数" data-col="sampling">'
       + (samples.length
           ? '<span style="font-size:12px;display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap">' + samples.map(s => '<span style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:2px 8px">' + s + '</span>').join('') + '</span>'
           : '<span style="color:var(--dim)">—</span>')
@@ -6849,7 +6850,7 @@ function renderAvailableModels(){
       + '<td style="text-align:center" data-label="能力">' + capHtml + '</td>'
       + '<td style="text-align:center" data-label="上下文">' + ctx + '</td>'
       + '<td style="text-align:center" data-label="最大输出">' + maxOut + '</td>'
-      + '<td style="text-align:left" data-label="思考档位">' + effort + '</td>'
+      + '<td style="text-align:left" data-label="思考档位" data-col="effort">' + effort + '</td>'
       + sampleCell
       + '</tr>';
   }).join('');
@@ -8624,7 +8625,7 @@ function accountRow(a){
   const alertRows = coolRow(a) + limitRow(a);
   return '<tr' + (alertRows ? ' class="has-alert"' : '') + '>'
     + '<td style="text-align:center;white-space:nowrap" data-label="版本">' + realmBadge + tierBadgeBlock + '</td>'
-    + '<td style="text-align:left" data-label="账号">'
+    + '<td style="text-align:left" data-label="账号" data-col="account">'
     // 账号名（大一号）+ 备注 chip 同一行；备注从独立一行收进账号后面。
     +   '<div class="acct-name-row">'
     +     '<span class="acct-name" title="' + esc(a.nickname) + '">' + esc(a.nickname) + '</span>'
@@ -8662,7 +8663,7 @@ function accountRow(a){
     + '<td style="text-align:center" data-label="出口">' + slotSelectHtml(a) + '</td>'
     + '<td style="text-align:center;white-space:nowrap" data-label="权重">'
     +   '<select class="mini-select" title="' + esc(WEIGHT_TIP) + '" onchange="setAccountWeight(&quot;' + uidAttr + '&quot;, this.value, this)">' + weightOpts + '</select></td>'
-    + '<td style="text-align:left;white-space:normal" data-label="积分">' + credText + '</td>'
+    + '<td style="text-align:left;white-space:normal" data-label="积分" data-col="credit">' + credText + '</td>'
     + '<td style="text-align:right" data-label="请求">' + fmt(usage.requests) + '</td>'
     + '<td style="text-align:right" data-label="总 token" data-tip="' + fmt(usage.total_tokens) + '">' + fmtCompact(usage.total_tokens) + '</td>'
     + '<td style="text-align:right" data-label="缓存" data-tip="' + fmt(usage.cached_tokens) + '">' + fmtCompact(usage.cached_tokens) + '</td>'
@@ -10622,7 +10623,7 @@ async function refreshInner(gen){
         + '<td class="mono" data-label="时间">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
         + '<td class="mono" data-label="模型">' + esc(r.model) + '</td>'
         + '<td data-label="推理强度">' + (r.reasoning_effort ? ('<span class="badge-effort">' + esc(r.reasoning_effort) + '</span>') : '<span style="color:var(--dim)">—</span>') + '</td>'
-        + '<td class="mono" style="font-size:11px;color:var(--dim)" data-label="账号" title="' + esc(r.account||'') + '">' + esc(acctName(r.account)) + '</td>'
+        + '<td class="mono" style="font-size:11px;color:var(--dim)" data-label="账号" data-col="account" title="' + esc(r.account||'') + '">' + esc(acctName(r.account)) + '</td>'
         + '<td class="mono" style="font-size:11px;color:var(--dim)" data-label="API Key" title="' + esc(r.key||'') + '">' + esc(r.key_name || '—') + '</td>'
         + '<td data-label="模式"><span class="badge ' + (r.stream?'s':'') + '">' + (r.stream?'流式':'非流式') + '</span></td>'
         + '<td data-label="结果">' + outcomeBadge(r) + '</td>'
@@ -10634,7 +10635,7 @@ async function refreshInner(gen){
         + '<td style="color:var(--think)" data-label="思考">' + fmt(r.reasoning_tokens) + '</td>'
         + '<td data-label="缓存">' + (r.cache_hit_pct!=null ? r.cache_hit_pct+'%' : '—') + '</td>'
         + '<td data-label="总 token"><b>' + fmt(r.total_tokens) + '</b></td>'
-        + '<td data-label="积分" style="color:var(--accent2)">' + (r.credit != null ? Number(r.credit).toFixed(2) : '—') + '</td>'
+        + '<td data-label="积分" data-col="credit" style="color:var(--accent2)">' + (r.credit != null ? Number(r.credit).toFixed(2) : '—') + '</td>'
         + '<td data-label="OpenRouter 价估算" class="cost-cell pricing-col" style="color:var(--warn)"'
         +   (costKey ? ' data-cost-key="' + esc(costKey) + '"' : '') + '>'
         +   fmtCost(r.cost_cny)
@@ -14373,7 +14374,7 @@ function renderProxySlots(){
         + '<td data-label="名称"><input value="' + esc(s.name || '') + '" placeholder="' + esc(s.label || '') + '" oninput="PROXY_SLOTS[' + i + '].name=this.value; markSlotsDirty()" class="slot-input"></td>'
         + '<td data-label="代理地址"><input value="' + esc(s.url || '') + '" oninput="PROXY_SLOTS[' + i + '].url=this.value; markSlotsDirty()" class="slot-input mono"></td>'
         + '<td data-label="出口">' + slotExitHtml(s) + '</td>'
-        + '<td style="text-align:center" data-label="启用"><input type="checkbox" ' + (s.enabled === false ? '' : 'checked')
+        + '<td style="text-align:center" data-label="启用" data-col="enabled"><input type="checkbox" ' + (s.enabled === false ? '' : 'checked')
         +   ' onchange="PROXY_SLOTS[' + i + '].enabled=this.checked; markSlotsDirty()"></td>'
         + '<td style="text-align:center" data-label="绑定账号">' + (s.bound || 0) + '</td>'
         + '<td style="text-align:center;white-space:nowrap" data-label="">'
@@ -15567,7 +15568,7 @@ function renderPerfMatrix(usage, perf){
     const summaryRow = '<tr style="background:rgba(37,99,235,.06);font-weight:600">'
       + '<td style="text-align:left" data-label="模型"><b>' + (filtering ? '筛选结果合计 (Filtered)' : '全部模型合计 (Total)') + '</b></td>'
       + '<td style="text-align:center" data-label="区域"><span style="color:var(--dim)">—</span></td>'
-      + '<td style="text-align:left" data-label="账号"><span style="color:var(--dim)">' + (filtering ? '已筛选' : '全部账号') + '</span></td>'
+      + '<td style="text-align:left" data-label="账号" data-col="account"><span style="color:var(--dim)">' + (filtering ? '已筛选' : '全部账号') + '</span></td>'
       + '<td data-label="请求数">' + fmt(sumReq) + '</td>'
       + '<td data-label="失败">' + (sumErr
           ? ('<span style="color:var(--bad)">' + fmt(sumErr) + '</span>')
@@ -15657,7 +15658,7 @@ function renderPerfMatrix(usage, perf){
       return '<tr>'
         + '<td style="text-align:left" class="mono" data-label="模型"><b>' + esc(m.id) + '</b></td>'
         + '<td style="text-align:center;white-space:nowrap" data-label="区域">' + realmCell + '</td>'
-        + '<td style="text-align:left" data-label="账号">' + acctCell + '</td>'
+        + '<td style="text-align:left" data-label="账号" data-col="account">' + acctCell + '</td>'
         + '<td data-label="请求数">' + fmt(m.requests) + '</td>'
         + '<td data-label="失败">' + errCell + '</td>'
         + '<td data-label="总 Token"><b>' + fmt(m.total_tokens) + '</b></td>'
