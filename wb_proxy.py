@@ -16182,7 +16182,12 @@ def probe_account(account, model=None, timeout=30):
         # The label keeps its 80-char cut; `detail` rides along untouched so the
         # panel can show the whole upstream body on hover.
         row["status"] = exc.code
-        row["error"] = "HTTP %d: %s" % (exc.code, detail[:150])
+        # Keep the 401's WWW-Authenticate in the label: APISIX says
+        # error="invalid_token" there and serves an HTML body, so a body-only
+        # label reads like a proxy page and leaves the account parked in the
+        # pool while every dispatch bounces (#435's exemption is not meant to
+        # cover a gateway that names the credential as bad).
+        row["error"] = wb_accounts.http_error_message(exc, detail, 150)
         if exc.code == 403 and restriction_is_account_level(detail):
             # 测试也认账号级风控限制：不能用 60 秒的普通冷却把 2 小时覆盖掉，
             # 更不能用「测试通过」的语义把被限制的账号放回池子（见 #422）。
@@ -16193,7 +16198,7 @@ def probe_account(account, model=None, timeout=30):
             row["restricted"] = True
             row["fails"] = int(account.fails)
             return row
-        account.note_error("HTTP %d: %s" % (exc.code, detail[:80]),
+        account.note_error(wb_accounts.http_error_message(exc, detail, 80),
                            cooldown=60, detail=detail)
         row["fails"] = int(account.fails)
         return row
