@@ -789,5 +789,37 @@ def _failed_set(output):
     return set()
 
 
+class SuiteEntryPointTests(unittest.TestCase):
+    """每个 Python 套件都必须有「跑起来」的收尾。
+
+    仓库里两种风格并存：unittest 风格（`unittest.main()`）与脚本风格
+    （打印 `SUMMARY: PASS=/FAIL=` 后 `sys.exit(1 if FAIL else 0)`）。
+    入口一旦被删（解冲突 / 去重脚本很容易连带删掉文件末尾），脚本会
+    「零输出直接 exit 0」，而 run_all.py 只看退出码就判它通过 —— 整套
+    测试静默不执行，矩阵却显示全绿。2026-10-29 合并 v1.9 时真发生过一次
+    （_test_sanitize_fingerprint.py 丢掉 43 条），所以钉在这里。
+    """
+
+    def test_every_python_suite_has_an_entry_point(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        tests_dir = os.path.join(root, "tests")
+        missing = []
+        for name in sorted(os.listdir(tests_dir)):
+            if not (name.startswith("_test_") and name.endswith(".py")):
+                continue
+            with open(os.path.join(tests_dir, name), encoding="utf-8") as fh:
+                body = fh.read()
+            # 只看「有没有把失败传出去」这一件事，两种收尾都算：
+            #   unittest 风格  unittest.main(（它自己会 sys.exit）
+            #   脚本风格       sys.exit(...)（仓里三种打印写法不同，但都会 exit）
+            # 被删掉入口的文件两者都没有 —— 正是要拦的情况。
+            if "unittest.main(" in body or "sys.exit(" in body:
+                continue
+            missing.append(name)
+        self.assertEqual(
+            missing, [],
+            "这些套件没有入口收尾，跑起来会静默 exit 0（等于没测）: %s" % missing)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -437,4 +437,5 @@ class IdentityVerbVariantsTests(unittest.TestCase):
         self.assertEqual(out[2]["content"], fp)
 
 
-
+if __name__ == "__main__":
+    unittest.main()
