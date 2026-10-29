@@ -1351,9 +1351,9 @@ class Account(object):
         # AccountPool.apply_daily_credit_limit(); 0 disables the guard.
         self.daily_credit_limit = 0
         self.daily_credits_today = None
-        # The realm's free model ids, pushed by the same apply call. Empty
-        # until then, and an unknown model counts as paid, so the guard
-        # fails closed instead of leaking spend through unseen names.
+        # The realm's free model ids, pushed by the daily-credit and reserve
+        # apply calls. Empty until then, and an unknown model counts as paid,
+        # so both guards fail closed instead of leaking spend through unseen ids.
         self.free_models = frozenset()
         # Per-model daily guard: once ONE model burned the configured tokens
         # today the account stops being handed out for that model only -
@@ -1540,6 +1540,7 @@ class Account(object):
             # 账号档位（#505）：面板在「会员类型」旁显示包名与读取时刻。
             "tier": self.tier,
             "reserveCredits": int(self.reserve_credits or 0),
+            # Account-level state, even while an explicitly free model serves.
             "reserveBlocked": self.reserve_blocked(),
             "dailyTokenLimit": int(self.daily_token_limit or 0),
             "dailyTokensToday": (int(self.daily_tokens_today)
@@ -1670,14 +1671,18 @@ class Account(object):
         if self.path and os.path.exists(self.path):
             os.remove(self.path)
 
-    def reserve_blocked(self):
-        """True when the low-credit guard should keep this account idle.
+    def reserve_blocked(self, model=None):
+        """True when the low-credit guard should keep this account off `model`.
 
         Only a *known* balance can block: an account whose credits were never
         fetched stays usable, otherwise a fresh install would look empty.
+        A positive reserve exempts models the realm catalogue marks free;
+        paid, unknown, and model-less calls retain the account-level guard.
         """
         reserve = int(self.reserve_credits or 0)
         if reserve <= 0:
+            return False
+        if model and self.model_is_free(model):
             return False
         credits = self.credits
         if not isinstance(credits, dict):
@@ -2053,7 +2058,7 @@ class Account(object):
                 # 这个号已经进了 24 小时档，该去申诉而不是等下一次复探。
                 streak = "（第 %d 次）" % int(self.restricted_hits)
             return "%s 剩余 %s%s" % (label, _human_left(until - now), streak)
-        if self.reserve_blocked():
+        if self.reserve_blocked(model):
             return "余额低于保留线"
         if self.daily_limit_blocked():
             return "今日 Token 额度用尽"
@@ -2127,9 +2132,9 @@ class Account(object):
             return False
         if self.throttle_wait(model=model) > 0:
             return False
-        # Parked below the reserve: serving a request here is what would push
-        # the balance to zero and trigger the upstream reminder SMS.
-        if self.reserve_blocked():
+        # A positive reserve stops paid requests below the floor; catalogue-
+        # free models cannot spend the balance this guard protects.
+        if self.reserve_blocked(model):
             return False
         # Today's token budget is spent: keep the seat for tomorrow instead
         # of letting the upstream answer 429 for the rest of the day.
@@ -2452,6 +2457,12 @@ class Account(object):
 
     def can_daily_chat(self):
         if self.realm != "intl":
+            return False
+        # 403 / code 11140 is an account-level restriction. Scheduled daily
+        # activity must respect the same persisted restriction window as normal
+        # chat dispatch, otherwise every later activity slot probes the account
+        # again even though the upstream already told us to stop.
+        if self.restricted_until > time.time():
             return False
         if not self.last_daily_chat:
             return True
@@ -3007,6 +3018,11 @@ class Account(object):
         """
         if self.realm != "intl":
             return {"ok": False, "error": "daily chat is only for international accounts"}
+        # 11140 的限制窗口要和普通 chat 一样先挡住；这里单独返回失败形状，
+        # 不能把「账号受限」伪装成「今日活跃已完成」。
+        if self.restricted_until > time.time():
+            return {"ok": False, "skipped": True, "restricted": True,
+                    "error": "账号处于上游风控限制窗口，跳过每日活跃"}
         # 当日活跃成功后再触发（下一个定时点、手动补跑、并发重复调度）直接
         # 跳过，连桌面腿也不发：这一天的 30/50 积分已经拿到了。
         if not self.can_daily_chat():
@@ -3138,8 +3154,12 @@ class Account(object):
             except Exception:
                 err = str(exc)
             # 403 / 11140 是账号级限制，不是本次任务失败：落盘冷却，让调度器
-            # 与手动补跑都不再拿这台「设备」去试探上游（#659）。
-            self.note_restriction_from_error(exc.code, err)
+            # 与手动补跑都不再拿这台「设备」去试探上游（#659 / 上游 #649）。
+            # 用统一的 note_restriction_from_error 判定，别在这里再抄一份 11140 解析；
+            # 返回形状沿用上游：带 restricted 标记，调用方据此跳过后续时段。
+            if self.note_restriction_from_error(exc.code, err):
+                return {"ok": False, "restricted": True,
+                        "error": f"HTTP {exc.code} / 11140: {err[:100]}"}
             return {"ok": False, "error": f"HTTP {exc.code}: {err[:100]}"}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -4870,7 +4890,7 @@ class AccountPool(object):
                 else:
                     account.proxy = account.proxy_legacy
 
-    def apply_reserve_credits(self, values=None):
+    def apply_reserve_credits(self, values=None, free_models=None):
         """Re-resolve the low-credit guard for every account.
 
         Same shape as apply_proxy_slots(): settings.json is the source of
@@ -4878,7 +4898,8 @@ class AccountPool(object):
         needs no extra settings lookup. `values` is the guard resolved per
         realm ({"global": g, "intl": ..., "cn": ...}); each account picks its
         own realm, so a per-realm override lands only on that realm's accounts
-        while the global default keeps covering both.
+        while the global default keeps covering both. `free_models` is the
+        caller's realm -> free-id catalogue view; None retains the last one.
         """
         import wb_settings
 
@@ -4887,6 +4908,9 @@ class AccountPool(object):
         with self._lock:
             for account in self.accounts:
                 account.reserve_credits = _realm_limit(values, account.realm)
+                if free_models is not None:
+                    account.free_models = frozenset(
+                        free_models.get(account.realm) or ())
         return values
 
     def apply_expiring_window(self, values=None):

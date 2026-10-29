@@ -213,9 +213,7 @@ th.sortable:focus-visible .sort-arrow.idle{opacity:1}
 /* 中屏（641–960px）：桌面表格布局还在，但横向空间有限。固定 px 的说明上限
    在这个区间最挤——一条 429 原文能把「账号」压到贴着「时间」。这里把说明列
    收到 300px（行内 max-width 优先级更高，须 !important 才盖得住）；表格下限
-   720px 不动，摆不下仍横向滚动，列宽不会被压扁。账号列的 160px 上限不动。
-   选择器用 data-col 而不是 data-label：i18n 会把 data-label 就地翻成英文 /
-   繁中（见本文件顶部 doAttrs 的说明），用中文 label 选择器一切语言就失效。 */
+   720px 不动，摆不下仍横向滚动，列宽不会被压扁。账号列的 160px 上限不动。 */
 @media (min-width:641px) and (max-width:960px){
   td[data-col="note"] .note-clip{max-width:300px!important}
 }
@@ -228,13 +226,7 @@ th.sortable:focus-visible .sort-arrow.idle{opacity:1}
 /* 活动表的短标签列（时间/区域/任务/来源/结果）不许逐字折行：表格自动布局
    里说明列一挤，这些列会被压到一字宽——「国际版每日活跃」变成一字一行的
    竖条，行高撑到七八行。nowrap 给布局一个真实下限（列至少要放得下标签），
-   宽度不够时整表横向滚动，而不是把标签竖起来；说明列仍是弹性吸收方。
-   用 data-col：data-label 会被 i18n 翻译成英文 / 繁中，切语言后这些规则会
-   静默失效（td 里另存一份不变的 data-col 专供样式与测试用）。
-   全文件已统一到这个口径：account-cards 的「账号」「积分」、data-cards 的「启用」、
-   modelsTable 的「思考档位」「默认采样参数」也都换成了 data-col。唯一保留的
-   `td:not([data-label])` 是"有没有这个属性"的存在性判断，与取值无关，不受 i18n 影响。
-   tests/_test_i18n_traditional.js 钉住了这条不变量：样式里出现 [属性=] 就红。 */
+   宽度不够时整表横向滚动，而不是把标签竖起来；说明列仍是弹性吸收方。 */
 table.activity-table td[data-col="time"],
 table.activity-table td[data-col="realm"],
 table.activity-table td[data-col="task"],
@@ -6993,8 +6985,8 @@ async function loadGrowthTasks(){
       const rwd = (t.reward_credit ? ('<b style="color:var(--accent2)">+' + t.reward_credit + '</b> 积分') : '') +
                   (t.reward_energy ? (' <span style="color:var(--accent)">+' + t.reward_energy + ' 能量</span>') : '');
       return '<tr>'
-        + '<td data-label="任务"><b>' + esc(t.name) + '</b><br><span class="mono" style="font-size:11px;color:var(--dim)">' + esc(t.task_code) + '</span></td>'
-        + '<td style="font-size:12px;color:var(--dim);max-width:300px" data-label="说明">' + esc(t.description || '-') + '</td>'
+        + '<td data-label="任务" data-col="task"><b>' + esc(t.name) + '</b><br><span class="mono" style="font-size:11px;color:var(--dim)">' + esc(t.task_code) + '</span></td>'
+        + '<td style="font-size:12px;color:var(--dim);max-width:300px" data-label="说明" data-col="note">' + esc(t.description || '-') + '</td>'
         + '<td data-label="进度">' + prog + '</td>'
         + '<td data-label="奖励">' + (rwd || '-') + '</td>'
         + '<td data-label="状态">' + stBadge
@@ -10620,13 +10612,13 @@ async function refreshInner(gen){
         const costKey = PRICING_ON ? costRowKey(r, i) : '';
         if(costKey) COST_TIP_ROWS.set(costKey, r);
         return '<tr>'
-        + '<td class="mono" data-label="时间">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
+        + '<td class="mono" data-label="时间" data-col="time">' + esc((r.iso||'').replace('T',' ').slice(5)) + '</td>'
         + '<td class="mono" data-label="模型">' + esc(r.model) + '</td>'
         + '<td data-label="推理强度">' + (r.reasoning_effort ? ('<span class="badge-effort">' + esc(r.reasoning_effort) + '</span>') : '<span style="color:var(--dim)">—</span>') + '</td>'
         + '<td class="mono" style="font-size:11px;color:var(--dim)" data-label="账号" data-col="account" title="' + esc(r.account||'') + '">' + esc(acctName(r.account)) + '</td>'
         + '<td class="mono" style="font-size:11px;color:var(--dim)" data-label="API Key" title="' + esc(r.key||'') + '">' + esc(r.key_name || '—') + '</td>'
         + '<td data-label="模式"><span class="badge ' + (r.stream?'s':'') + '">' + (r.stream?'流式':'非流式') + '</span></td>'
-        + '<td data-label="结果">' + outcomeBadge(r) + '</td>'
+        + '<td data-label="结果" data-col="result">' + outcomeBadge(r) + '</td>'
         + '<td data-label="耗时">' + ms(r.elapsed_ms) + '</td>'
         + '<td data-label="首字">' + ms(r.ttft_ms) + '</td>'
         + '<td data-label="速度">' + (r.tokens_per_sec ? r.tokens_per_sec.toFixed(1) : '—') + '</td>'
@@ -15567,7 +15559,7 @@ function renderPerfMatrix(usage, perf){
     }
     const summaryRow = '<tr style="background:rgba(37,99,235,.06);font-weight:600">'
       + '<td style="text-align:left" data-label="模型"><b>' + (filtering ? '筛选结果合计 (Filtered)' : '全部模型合计 (Total)') + '</b></td>'
-      + '<td style="text-align:center" data-label="区域"><span style="color:var(--dim)">—</span></td>'
+      + '<td style="text-align:center" data-label="区域" data-col="realm"><span style="color:var(--dim)">—</span></td>'
       + '<td style="text-align:left" data-label="账号" data-col="account"><span style="color:var(--dim)">' + (filtering ? '已筛选' : '全部账号') + '</span></td>'
       + '<td data-label="请求数">' + fmt(sumReq) + '</td>'
       + '<td data-label="失败">' + (sumErr
@@ -15657,7 +15649,7 @@ function renderPerfMatrix(usage, perf){
       }
       return '<tr>'
         + '<td style="text-align:left" class="mono" data-label="模型"><b>' + esc(m.id) + '</b></td>'
-        + '<td style="text-align:center;white-space:nowrap" data-label="区域">' + realmCell + '</td>'
+        + '<td style="text-align:center;white-space:nowrap" data-label="区域" data-col="realm">' + realmCell + '</td>'
         + '<td style="text-align:left" data-label="账号" data-col="account">' + acctCell + '</td>'
         + '<td data-label="请求数">' + fmt(m.requests) + '</td>'
         + '<td data-label="失败">' + errCell + '</td>'

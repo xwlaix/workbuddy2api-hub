@@ -2022,6 +2022,23 @@ def apply_daily_credit_limit(refresh=False):
     return POOL.apply_daily_credit_limit(limits, credits, free_models)
 
 
+def apply_reserve_credits(refresh=False):
+    """Publish the reserve and, only when it is on, the realm free ids.
+
+    This reuses the existing 60-second local catalogue cache; it never folds
+    usage logs or adds network work. The settings-save path passes refresh=True
+    so switching the guard off also clears the in-memory threshold.
+    """
+    if POOL is None:
+        return 0
+    values = wb_settings.limit_values(ACCOUNTS_DIR, "reserve_credits")
+    on = any(value > 0 for value in values.values())
+    if not on and not refresh:
+        return values
+    return POOL.apply_reserve_credits(
+        values, free_models_by_realm() if on else None)
+
+
 def apply_model_daily_token_limit(refresh=False):
     """Push the per-model daily token setting and today's counts into the pool."""
     if POOL is None:
@@ -10263,7 +10280,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.8.11",
+        "version": "1.9.1",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -12045,37 +12062,20 @@ SANITIZE_DSH_GUI_RE = re.compile(
     r" whose URL the runtime context names\.")
 SANITIZE_DSH_GUI_REPLACEMENT = r"\1 whose URL is named in the runtime context."
 SANITIZE_DSH_GUI_LOWER = "whose url the runtime context names"
-# 文件引用说明段：DeepSeek Harness 的官方插件 `@deepseek-ai/dsh-file-reference`
-# （packages/context/file-reference，由 `@deepseek-ai/dsh-api-session-controller` 引入）
-# 注入的 FILE_REFERENCE_PROMPT 里，连续两句命中与 #570 同一套「A 句 + B 句连续出现」
-# 的 11-128 判据：
-#   A: Tokens prefixed with @ are paths the user explicitly referenced.
-#   B: Relative paths resolve from the workspace root; absolute paths identify
-#      files or directories on the host.
+# 文件引用段（#683）：官方插件 @deepseek-ai/dsh-file-reference 注入的
+# FILE_REFERENCE_PROMPT 整段命中同一套「A 句 + B 句连续出现」判据，
+# 回 400 / code 11-128。实测（2026-10-28，CN 号池）：整段 5 句连排稳定 400，
+# 只发前两句 200 —— 匹配的是整段，不是单词。
 #
-# 二分实测（2026-10-28，稳定复现 3/3）：
-#   · A 单独 200、B 单独 200、A+B 连续 400 —— 指纹是「两句连续」这一整段；
-#   · 改 A 措辞 / 改 B 措辞 / 两句之间插一句话 / 换序 / 合并成一句，全部 200；
-#   · 只把 B 的 `absolute` 换成 `full` 无效（仍 400），说明不是单词级匹配；
-#   · 请求规模（627 条无害消息）、system 总长度（同长度填充）、身份句条数、
-#     指纹所在角色均不是原因（均已单独测过）。
-#
-# 取语义损失最小的改法：只在 A 句里补一个 `that`，一个词不多不少，句子意思
-# 完全不变，也不碰 B 句与后续内容。负向前瞻保证幂等（补过就不再补）。
-#
-# A/B probe: the fingerprint is the *pair* of contiguous sentences injected by
-# DeepSeek Harness's official `dsh-file-reference` plugin, matching the same
-# "sentence A + sentence B contiguous" rule as #570. Each sentence alone passes;
-# any wording change, an inserted clause, reordering or merging also passes.
-# We only add one word (`that`) to sentence A, which preserves the meaning
-# verbatim and is idempotent via the negative lookahead.
-# 大小写要按原文保留：用捕获组 + 反向引用，而不是把整句替换成写死首字母大写的
-# 固定字符串。第一版（#683）就是固定字符串，输入小写会被改写；上游 835da5a 的
-# 配套用例 `test_case_insensitive` 钉的正是这一点，这里对齐上游写法。
+# 修法只动 A 句一个词：`paths the user` -> `paths that the user`，语义不变，
+# 整段不再连续；负向前瞻 (?!that ) 保证幂等。作用域与 GUI 段一致：
+# system / developer / assistant，user / tool 里的同句属用户数据不改写（#537）。
+# 用捕获组 + 反向引用而不是固定字符串，输入小写时保留原文大小写
+# （上游 835da5a 的 test_case_insensitive 钉的正是这一点）。
 SANITIZE_DSH_FILEREF_RE = re.compile(
     r"(?i)(Tokens prefixed with @ are paths )(?!that )(the user explicitly referenced\.)")
 SANITIZE_DSH_FILEREF_REPLACEMENT = r"\1that \2"
-SANITIZE_DSH_FILEREF_PROBE = "are paths the user explicitly referenced"
+SANITIZE_DSH_FILEREF_LOWER = "are paths the user explicitly referenced"
 # 品牌词缩减（#574）：`DeepSeek Harness` 单独出现放行，但它和 GUI 描述句
 # （`this page` / `this GUI` / `this app`）连续出现时命中同一套 11-128 校验。
 # 逐段二分实测：只把品牌缩成 `DeepSeek` 就能通过，句子其余部分不用动；
@@ -12133,10 +12133,9 @@ def has_fingerprint(text, identity=True):
     if (SANITIZE_DSH_GUI_LOWER in low
             and SANITIZE_DSH_GUI_RE.search(text) is not None):
         return True
-    # 文件引用说明段：用 A 句做廉价前置探测；真命中交给
-    # sanitize_text 里那条幂等替换。与 GUI 段同口径，只在 identity 角色生效，
-    # user / tool 里的同句属用户数据不改写（#537）。
-    if SANITIZE_DSH_FILEREF_PROBE in low:
+    # 文件引用段：同一条廉价前置探测，命中才走正则。
+    if (SANITIZE_DSH_FILEREF_LOWER in low
+            and SANITIZE_DSH_FILEREF_RE.search(text) is not None):
         return True
     # 动词短语只是廉价前置筛：真命中与否交给正则判定。这样 "powered by" 出现在
     # 与自我介绍无关的句子（工具/插件的产品描述）时不会走进 sanitize_text 的其余
@@ -12158,8 +12157,7 @@ def sanitize_text(text, identity=True):
         text = SANITIZE_IDENTITY_RE.sub(SANITIZE_IDENTITY_REPLACEMENT, text)
         # GUI 描述段单独一条规则：锚定整句，只调整句尾语序。
         text = SANITIZE_DSH_GUI_RE.sub(SANITIZE_DSH_GUI_REPLACEMENT, text)
-        # 文件引用说明段：A 句补一个 that，破坏「A+B 连续」
-        # 这一整段指纹；负向前瞻保证重复执行不会叠加。
+        # 文件引用段：只补一个词，打断整段连续匹配。
         text = SANITIZE_DSH_FILEREF_RE.sub(SANITIZE_DSH_FILEREF_REPLACEMENT, text)
         # 品牌词缩减放在最后：GUI 规则还认全名，先让它匹配原文。
         text = SANITIZE_BRAND_RE.sub(SANITIZE_BRAND_REPLACEMENT, text)
@@ -15131,6 +15129,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # share the same fold, and calling them separately paid for it three
     # times on every request.
     apply_daily_guards()
+    apply_reserve_credits()
     # 剩余用量优先调度（开关默认关）：把「估计剩余接近耗尽」的 (账号, 模型)
     # 权重推给池，让它们先接单。只在开关打开时读剩余估算（载荷有短 TTL，热路径
     # 上是缓存命中）；关着时推空表，把上一次可能留下的权重清掉，下一个请求就
@@ -19126,11 +19125,11 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    # 1.8.11 = 本地补丁版（非上游发版）：任务链路 403/11140 落盘 restrictedUntil
-    # （wb_accounts.note_restriction_from_error）+ 调度错峰可配
+    # 1.9.1 = 本地补丁版（上游 1.9.0 + 反风控补丁栈）：任务链路 403/11140 落盘
+    # restrictedUntil（wb_accounts.note_restriction_from_error）+ 调度错峰可配
     # （wb_scheduler.SCHEDULER_STAGGER_MIN/_MAX）。两处版本号必须一致，
     # tests/_test_release_engineering.py 钉着这一条。
-    server_version = "wb-proxy/1.8.11"
+    server_version = "wb-proxy/1.9.1"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -20644,8 +20643,8 @@ class Handler(BaseHTTPRequestHandler):
         if limits_payload is not None:
             reply["limits"] = wb_settings.limits_snapshot(ACCOUNTS_DIR)
         if touched:
-            if POOL and "reserve_credits" in touched:
-                POOL.apply_reserve_credits()
+            if "reserve_credits" in touched:
+                apply_reserve_credits(refresh=True)
             if any(k in touched for k in ("daily_token_limit", "daily_credit_limit",
                                           "model_daily_token_limit")):
                 # One pass refreshes all three: a limit edit is rare, and the
@@ -23983,7 +23982,7 @@ def _bootstrap_runtime(args):
     POOL = wb_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()
     POOL.apply_proxy_slots()
-    POOL.apply_reserve_credits()
+    apply_reserve_credits()
     # WB_MAX_CONCURRENT_CHAT=auto: size the chat ceiling from the pool that was
     # just loaded. Runs before the listener exists, so no request can hold a
     # slot yet and the semaphore swap is safe.
