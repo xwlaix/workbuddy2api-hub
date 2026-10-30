@@ -484,6 +484,9 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 <!-- 发版时：把下面的 Unreleased 段落整理成新版本号（## vX.Y.Z），整体移入 docs/CHANGELOG.md 顶部 -->
 
 - **流式终止**：设置 `WB_STOP_AT_SSE_DONE=1` 后，收到上游 SSE `[DONE]` 立即结束读取；默认关闭，保持原有行为。 / **Stream termination**: set `WB_STOP_AT_SSE_DONE=1` to stop reading at the upstream SSE `[DONE]` marker; disabled by default to retain existing behavior.
+- **上游错误正文缓存**：设置 `WB_CACHE_HTTP_ERROR_BODY=1` 后，读过的上游错误正文会被复用，重试与排障时不再重复拉取；默认关闭，行为不变。 / **Upstream error body cache**: with `WB_CACHE_HTTP_ERROR_BODY=1` a body that has already been read is reused; off by default.
+- **面板密码失败不再静默放行（fail-closed）**：解释器缺少 `hashlib.pbkdf2_hmac` 时，面板明确提示「加密不可用」，不再一律报「密码错误」；命令行用 `--panel-password` 设密码若失败，进程直接拒绝启动，不会带着旧密码（甚至默认 `admin`）继续对外服务。 / **Panel password fail-closed**: a missing `pbkdf2_hmac` is reported as a crypto problem, and a failed `--panel-password` now aborts startup instead of silently keeping the old password.
+- **看板与词典**：设置页新增「安装更新」提示文案；看板刷新加上同 range 并发去重；并把 3 处新文案补进英文词典（切英文不再回落中文）。 / **Dashboard & i18n**: update-install hint, refresh de-duplication, and the missing English dictionary entries.
 
 - **v1.9.0 发布**：汇总 v1.8.0 之后的 10 个社区 PR（#649、#650、#652、#653、#669、#670、#671、#672、#684、#686）。完整变更、验证范围与已知限制见 **[docs/CHANGELOG.md](docs/CHANGELOG.md#v190)**；下一版的改动继续写在本段。
 - **v1.8.0 发布**：汇总 v1.7.33 之后的 #640、#642、#643、#645/#647，并补齐 #578、#618、#625 的发布记录。完整变更、验证范围与已知限制见 **[docs/CHANGELOG.md](docs/CHANGELOG.md#v180)**；下一版的改动继续写在本段。
