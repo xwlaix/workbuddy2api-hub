@@ -41,6 +41,11 @@ if not os.path.exists(PY):
     PY = sys.executable
 sys.path.insert(0, HERE)
 
+# 这份套件钉的是「要面板密码时」的 ETag 语义：无会话 → 401（而不是 304）。
+# 本机构建的 WB_PANEL_AUTH 默认已翻成 off（免密码），这里显式打开；受管子进程
+# 继承环境变量，所以设在这里对被测实例同样生效。
+os.environ["WB_PANEL_AUTH"] = "on"
+
 import _lifecycle as life            # noqa: E402  (spare port + managed process)
 
 PASS = 0

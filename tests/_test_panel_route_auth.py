@@ -144,6 +144,12 @@ class BoundaryCase(unittest.TestCase):
         wb_settings.set_api_keys(self.directory, [
             {"id": "k1", "name": "k", "key": KEY, "enabled": True}])
         self.updates = StubUpdates()
+        # 本套件钉的是「要求密码时」的门禁契约。构建里 WB_PANEL_AUTH 默认已翻成
+        # off（免密码），所以这里显式把密码校验打开 —— 默认值再怎么变，这份
+        # 契约断言都还在这儿。
+        gate = mock.patch.object(proxy, "PANEL_AUTH_REQUIRED", True)
+        gate.start()
+        self.addCleanup(gate.stop)
 
     def dispatch(self, path, headers=None, command="GET", body=b"", pool=None):
         request = DispatchRequest(path, headers=headers, command=command, body=body)

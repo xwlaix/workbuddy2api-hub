@@ -176,7 +176,7 @@ python tests/run_all.py            # 全部套件
 python tests/run_all.py realm      # 只跑名字里含 realm 的
 ```
 
-- 234 个套件：175 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
+- 235 个套件：176 个 Python + 59 个 JS；JS 需要 PATH 上有 `node`，缺失时会跳过并提示。
 - `tests/_mobile_check.py` 是独立的 Playwright 手机/桌面布局检查器（需自行安装 Playwright），按需手动运行，不在上面的套件集里。
 - CI（`.github/workflows/tests.yml`）跑同一条命令：Ubuntu 上 python 3.9 与 3.12（3.9 是本项目声称的最低版本），Windows 上 python 3.12；推送 `v*` tag 时额外断言 **tag == 源码版本**（`-ci` 演练 tag 豁免）。
 
@@ -482,6 +482,8 @@ export ANTHROPIC_API_KEY="你在看板设置中添加并绑定的API_Key"
 ## 六、版本更新记录 (Changelog)
 
 <!-- 发版时：把下面的 Unreleased 段落整理成新版本号（## vX.Y.Z），整体移入 docs/CHANGELOG.md 顶部 -->
+
+- **面板默认不校验密码（`WB_PANEL_AUTH`，默认 off）**：本机构建开箱即免登录，打开 `http://127.0.0.1:8788/` 直接进看板。免密码时**面板全部路由**都不要求会话——包括 `/accounts` `/settings` `/logs` 的读写、`/settings/reveal`（复制明文 API Key）与 `/panel/password`（改密码）。`/v1/chat/completions`、`/v1/messages` 仍必须带 API Key（只读 GET 免 Key，供看板读模型目录）—— 那是额度边界、不是密码，免密码不该顺手把它也放开。想回到上游行为：启动时设 `WB_PANEL_AUTH=on`（`on`/`1`/`true`/`yes` 都行），面板就恢复成「只认 `/panel/login` 发出的会话」。**安全前提**：免密码等于「谁能连到这个端口，谁就能改设置、看 Key」，请只绑回环或可信网络；启动日志会写明当前处于哪一种状态。 / **Panel password is off by default** (`WB_PANEL_AUTH`, default off): this build opens the dashboard without a login, and *every* panel route stops asking for a session - including `/settings/reveal` (plaintext API key) and `/panel/password`. `/v1/chat/completions` and `/v1/messages` still require the API key (read-only GETs are allowed so the dashboard can list models): that is a quota boundary, not a password. Set `WB_PANEL_AUTH=on` at startup to restore the upstream behaviour. Because passwordless means "whoever reaches this port can change settings and read the key", bind it to loopback or a trusted network only; the startup log states which mode is active.
 
 - **流式终止**：设置 `WB_STOP_AT_SSE_DONE=1` 后，收到上游 SSE `[DONE]` 立即结束读取；默认关闭，保持原有行为。 / **Stream termination**: set `WB_STOP_AT_SSE_DONE=1` to stop reading at the upstream SSE `[DONE]` marker; disabled by default to retain existing behavior.
 - **上游错误正文缓存**：设置 `WB_CACHE_HTTP_ERROR_BODY=1` 后，读过的上游错误正文会被复用，重试与排障时不再重复拉取；默认关闭，行为不变。 / **Upstream error body cache**: with `WB_CACHE_HTTP_ERROR_BODY=1` a body that has already been read is reused; off by default.

@@ -541,6 +541,24 @@ USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
 # "admin"), independent of the /v1 API key. Sessions live in memory only, so a
 # restart forces browsers to log in again.
 PANEL = wb_settings.PanelSessions()
+# Panel password switch. **Default is off**: this build opens the web panel
+# without a login. Set WB_PANEL_AUTH=on to get the password back (that is the
+# upstream behaviour). The switch lifts the *panel* gate only - /v1 chat and the
+# Anthropic Messages route keep requiring the API key (see _key_ok), because a
+# passwordless panel must not hand the upstream quota to everyone on the LAN.
+PANEL_AUTH_ENV = "WB_PANEL_AUTH"
+
+
+def panel_auth_required(environ=None):
+    """Whether the browser panel asks for its password. Default: no."""
+    source = os.environ if environ is None else environ
+    raw = str(source.get(PANEL_AUTH_ENV) or "").strip().lower()
+    if not raw:
+        return False        # 未设置 / 空值 = 不要密码（与默认一致）
+    return raw not in ("off", "0", "false", "no", "disabled")
+
+
+PANEL_AUTH_REQUIRED = panel_auth_required()
 API_KEY_FILE_SET = False
 def configured_keys():
     """Panel-managed API keys, always read fresh so panel edits apply at once."""
@@ -10280,7 +10298,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.9.4",
+        "version": "1.9.5",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -19138,7 +19156,7 @@ class Handler(BaseHTTPRequestHandler):
     # restrictedUntil（wb_accounts.note_restriction_from_error）+ 调度错峰可配
     # （wb_scheduler.SCHEDULER_STAGGER_MIN/_MAX）。两处版本号必须一致，
     # tests/_test_release_engineering.py 钉着这一条。
-    server_version = "wb-proxy/1.9.4"
+    server_version = "wb-proxy/1.9.5"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -19510,7 +19528,14 @@ class Handler(BaseHTTPRequestHandler):
         """True when the request carries a right key (or no key is needed)."""
         # An authenticated panel session also unlocks the management APIs,
         # so the browser never has to keep the API key in localStorage.
-        if self._panel_ok():
+        # 免密码构建（PANEL_AUTH_REQUIRED 为假）时这条捷径不生效 —— 那时
+        # 「有会话」和「没会话」没有区别，否则 POST 聊天会跟着变成免 Key。
+        if PANEL_AUTH_REQUIRED and self._panel_ok():
+            return True
+        # 关掉面板密码后，看板要免登录地读 /v1/models 这类只读接口。
+        # 只放行 GET：POST /v1/chat/completions 与 /v1/messages 仍然要 API Key，
+        # 否则「关掉面板密码」就等于把上游额度对局域网开放。
+        if not PANEL_AUTH_REQUIRED and getattr(self, "command", "") == "GET":
             return True
         self.key_entry = identify_key(self._supplied_key())
         if self.key_entry:
@@ -19624,6 +19649,14 @@ class Handler(BaseHTTPRequestHandler):
         token = (self.headers.get("X-Panel-Token") or "").strip()
         return token
     def _panel_ok(self):
+        """面板门禁判定。
+
+        WB_PANEL_AUTH 默认 off（本机构建免密码）：不要求会话，面板所有路由
+        —— 读、写、复制明文 Key、改密码 —— 一律放行。
+        设成 on 时恢复上游行为：只认 /panel/login 发出的会话令牌。
+        """
+        if not PANEL_AUTH_REQUIRED:
+            return True
         return PANEL.valid(self._panel_token())
     @staticmethod
     def _is_panel_route(path):
@@ -19804,7 +19837,8 @@ class Handler(BaseHTTPRequestHandler):
         # show the login screen before it can hold a session.
         crypto_ok, crypto_reason = wb_settings.check_pbkdf2_available()
         info = {
-            "panel_password_required": True,
+            # 关掉密码开关时明确告诉看板「不用登录」，前端据此直接进面板。
+            "panel_password_required": PANEL_AUTH_REQUIRED,
             "panel_password_is_default": wb_settings.panel_password_is_default(ACCOUNTS_DIR),
             "authenticated": self._panel_ok(),
             "crypto_ok": crypto_ok,
@@ -20323,6 +20357,8 @@ class Handler(BaseHTTPRequestHandler):
     def _get_settings_reveal(self, query):
         # The panel only ever draws masked keys, so copying one needs an
         # explicit request. Panel session required, API key is not enough.
+        # 免密码构建下这里也放行（业主明确要求面板不做密码校验）：
+        # 它能吐出明文 API Key，所以「谁能连到这个端口」就是唯一的边界。
         if not self._panel_ok():
             return self._error(401, "panel password required", "invalid_request_error")
         wanted = (query.get("id") or [""])[0]
@@ -21636,6 +21672,7 @@ class Handler(BaseHTTPRequestHandler):
             PANEL.revoke(self._panel_token())
             return self._json(200, {"ok": True})
         # Everything past this point requires an authenticated panel session.
+        # 免密码构建下改密码也不需要会话（改完仍然是免密码）。
         if not self._panel_ok():
             return self._error(401, "panel password required", "invalid_request_error")
         if path == "/panel/password":
@@ -24032,6 +24069,12 @@ def _bootstrap_runtime(args):
                 "Cannot start: the requested panel password could not be set.") from exc
     elif wb_settings.panel_password_is_default(ACCOUNTS_DIR):
         log("panel      : password is still the default 'admin' - change it in the panel")
+    if not PANEL_AUTH_REQUIRED:
+        log("panel      : password check DISABLED (default; set %s=on to re-enable)"
+            % PANEL_AUTH_ENV)
+        log("panel      : anyone who can reach this port can open the panel, "
+            "read the plaintext API key and change settings - keep it on loopback "
+            "or a trusted network only")
     POOL = wb_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()
     POOL.apply_proxy_slots()

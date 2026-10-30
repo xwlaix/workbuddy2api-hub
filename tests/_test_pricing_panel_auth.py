@@ -98,6 +98,8 @@ class PanelRouteBoundaryTests(unittest.TestCase):
         patches = [
             mock.patch.multiple(proxy, ACCOUNTS_DIR=self.directory,
                                 API_KEY=None, POOL=None),
+            # 本套件钉「要求密码时」的边界；默认值已翻成免密码，这里显式打开。
+            mock.patch.object(proxy, "PANEL_AUTH_REQUIRED", True),
             mock.patch.object(proxy, "PRICING", FakePricing()),
             mock.patch.object(proxy, "fetch_models",
                               lambda realm=None: [("gpt-4o", {})]),

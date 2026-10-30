@@ -40,6 +40,11 @@ _TMP_ENV = isolated_data_dirs("wb-agents-cli-")
 os.environ["no_proxy"] = "127.0.0.1,localhost"
 os.environ["NO_PROXY"] = os.environ["no_proxy"]
 
+# 这份契约断言的是「要面板密码时」的行为（/agents 读要会话，/agents/cli 不要）。
+# 本机构建的 WB_PANEL_AUTH 默认已翻成 off（免密码），所以这里显式打开 ——
+# 必须在 import wb_proxy 之前设，模块级常量是导入时算的。
+os.environ["WB_PANEL_AUTH"] = "on"
+
 
 import wb_agents  # noqa: E402
 import wb_proxy  # noqa: E402

@@ -29,6 +29,11 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 这份套件钉的是「要面板密码时」的访问边界（匿名 / 仅 Key 都读不到 /updates）。
+# 本机构建的 WB_PANEL_AUTH 默认已翻成 off（免密码），这里显式打开 —— 必须在
+# import wb_proxy 之前设，模块级常量是导入时算的。
+os.environ["WB_PANEL_AUTH"] = "on"
+
 from _isolated_dirs import isolated_data_dirs  # noqa: E402  (its own data root)
 
 _TMP = isolated_data_dirs("wb-update-check-")
