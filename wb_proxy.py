@@ -10222,6 +10222,8 @@ def runtime_settings_view():
                          daily_chat_random=not bool(
                              wb_settings.daily_chat_times(ACCOUNTS_DIR))),
         "ui_language": wb_settings.ui_language(ACCOUNTS_DIR),
+        # 设置页据此决定要不要显示「面板密码」那类二次校验输入。
+        "panel_password_required": bool(PANEL_AUTH_REQUIRED),
         "pricing_variant_inherit": wb_settings.pricing_variant_inherit(ACCOUNTS_DIR),
         "pricing_enabled": wb_settings.pricing_enabled(ACCOUNTS_DIR),
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
@@ -10298,7 +10300,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.9.5",
+        "version": "1.9.6",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -19156,7 +19158,7 @@ class Handler(BaseHTTPRequestHandler):
     # restrictedUntil（wb_accounts.note_restriction_from_error）+ 调度错峰可配
     # （wb_scheduler.SCHEDULER_STAGGER_MIN/_MAX）。两处版本号必须一致，
     # tests/_test_release_engineering.py 钉着这一条。
-    server_version = "wb-proxy/1.9.5"
+    server_version = "wb-proxy/1.9.6"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -19532,17 +19534,22 @@ class Handler(BaseHTTPRequestHandler):
         # 「有会话」和「没会话」没有区别，否则 POST 聊天会跟着变成免 Key。
         if PANEL_AUTH_REQUIRED and self._panel_ok():
             return True
-        # 关掉面板密码后，看板要免登录地读 /v1/models 这类只读接口。
-        # 只放行 GET：POST /v1/chat/completions 与 /v1/messages 仍然要 API Key，
-        # 否则「关掉面板密码」就等于把上游额度对局域网开放。
+        # 先认 Key、再考虑「匿名只读放行」：顺序反了会让每个带 Key 的 GET 都被
+        # 提前短路，key_entry 永远是 None —— 于是 /v1/models 的按 Key 过滤、
+        # Key 绑定区域、/health 的就绪统计全部失效，写错 Key 的 GET 还会回 200
+        # 而不是 401（1.9.5 实测的回归）。
+        supplied = self._supplied_key()
+        if supplied:
+            self.key_entry = identify_key(supplied)
+            if self.key_entry:
+                return True
+            return not auth_required()
+        # 没带任何 Key：免密码模式下放行看板自身的只读 GET（/v1/models 等）。
+        # POST /v1/chat/completions 与 /v1/messages 不在此列 —— 它们落到下面的
+        # auth_required()，仍然必须带 Key。
         if not PANEL_AUTH_REQUIRED and getattr(self, "command", "") == "GET":
             return True
-        self.key_entry = identify_key(self._supplied_key())
-        if self.key_entry:
-            return True
-        if not auth_required():
-            return True
-        return False
+        return not auth_required()
     def _key_realm(self):
         """Realm bound to the key this request used, or "" when unbound."""
         return (self.key_entry or {}).get("realm") or ""
@@ -19656,8 +19663,36 @@ class Handler(BaseHTTPRequestHandler):
         设成 on 时恢复上游行为：只认 /panel/login 发出的会话令牌。
         """
         if not PANEL_AUTH_REQUIRED:
-            return True
+            return self._panel_origin_ok()
         return PANEL.valid(self._panel_token())
+    def _panel_origin_ok(self):
+        """免密码时的最低防线：挡住浏览器跨站写请求（CSRF）。
+
+        没有面板令牌以后，任何网页都能用「免预检的简单请求」（text/plain、
+        无自定义头）向 http://127.0.0.1:8788/settings/save 或 /shutdown 发 POST，
+        浏览器不会拦。拦得住的是同源策略的写入端：
+          · 浏览器跨站请求必带 Origin，且跨站时 Origin 与 Host 不一致；
+          · 同源请求的 Origin 与 Host 一致；
+          · curl / Python 脚本 / 单测桩不带 Origin —— 一律放行，CLI 完全透明。
+        只读方法不查（GET 没有副作用，跨站也拿不到响应内容）。
+        """
+        if getattr(self, "command", "GET") in ("GET", "HEAD", "OPTIONS"):
+            return True
+        origin = (self.headers.get("Origin") or "").strip()
+        if not origin:
+            return True
+        host = (self.headers.get("Host") or "").strip()
+        if not host:
+            return True
+        try:
+            origin_netloc = urlparse(origin).netloc
+        except Exception:
+            return True
+        if not origin_netloc or origin_netloc.lower() == host.lower():
+            return True
+        log("panel      : blocked cross-site %s %s (origin %s, host %s)"
+            % (self.command, self.path, origin, host))
+        return False
     @staticmethod
     def _is_panel_route(path):
         """Management endpoints shown in the web panel.
@@ -20376,9 +20411,14 @@ class Handler(BaseHTTPRequestHandler):
         # The static file carries a placeholder; replace it with the instance
         # default so the first paint already uses the right language.
         language = wb_settings.ui_language(ACCOUNTS_DIR)
+        # 免密码时把「不用登录」写进 <html>，首帧 CSS 就能直接把登录闸门按住，
+        # 不必等 /panel/status 回来再盖住（否则每次打开/刷新都闪一下密码框）。
+        # 静态文件本身不带这个属性：直接读 dashboard.html 的单测不受影响。
+        auth_mode = "on" if PANEL_AUTH_REQUIRED else "off"
         body = body.replace(
             b'data-ui-language="__WB_UI_LANGUAGE__"',
-            ('data-ui-language="%s"' % language).encode("utf-8"),
+            ('data-ui-language="%s" data-panel-auth="%s"'
+             % (language, auth_mode)).encode("utf-8"),
         )
         # 面板首页是纯静态资源（服务端逐字节原样发出、不含任何机密），所以可以
         # 允许浏览器存储副本、每次打开再回源校验：校验命中回 304（无 body），
@@ -20390,13 +20430,16 @@ class Handler(BaseHTTPRequestHandler):
         # 由 (文件 mtime_ns, size, language) 三者派生：前两个代表文件字节（本文件
         # 只在应用更新时被整体替换、从不原地修改），第三个就是本次实际注入的值，
         # 三者组合变化 ⇔ 响应字节变化。mtime 用纳秒精度，同一秒内的两次替换也能
-        # 得到不同 tag。
+        # 得到不同 tag。auth_mode 同理：它决定注入的 data-panel-auth，切换
+        # WB_PANEL_AUTH 之后旧的 tag 必须失效，否则客户端带 If-None-Match 回来会
+        # 拿到 304 + 旧模式的页面壳。
         etag = None
         try:
             st = os.stat(DASHBOARD_HTML)
             # 强校验符（不带 W/ 前缀）：响应是「文件字节 + 本次语言」的精确副本，
             # tag 变 ⇔ 字节变。
-            etag = '"%x-%x-%s"' % (st.st_mtime_ns, st.st_size, language)
+            etag = '"%x-%x-%s-%s"' % (st.st_mtime_ns, st.st_size, language,
+                                      auth_mode)
         except Exception:
             # stat 取不到（或时间戳无法表示）不是致命错误：退化为一律按普通
             # 200 处理，只是这一次没有条件请求支持，绝不让面板页本身打不开。
@@ -20869,15 +20912,18 @@ class Handler(BaseHTTPRequestHandler):
                     return self._error(400, str(exc), "invalid_request_error")
                 reply["identity_private_data"] = value
         if "identity_versions" in payload:
-            password = payload.get("panel_password") or ""
-            try:
-                valid = wb_settings.verify_panel_password(ACCOUNTS_DIR, password)
-            except wb_settings.PanelPasswordCryptoError as exc:
-                log("panel      : crypto failure verifying password: %s" % exc)
-                return self._error(500, str(exc), "server_error")
-            if not valid:
-                return self._error(401, "invalid panel password",
-                                   "invalid_request_error")
+            # 这一项历史上是唯一带二次密码校验的配置（出站身份版本号）。面板
+            # 免密码后它也必须一起放开，否则设置页保存时报「请输入面板密码」。
+            if PANEL_AUTH_REQUIRED:
+                password = payload.get("panel_password") or ""
+                try:
+                    valid = wb_settings.verify_panel_password(ACCOUNTS_DIR, password)
+                except wb_settings.PanelPasswordCryptoError as exc:
+                    log("panel      : crypto failure verifying password: %s" % exc)
+                    return self._error(500, str(exc), "server_error")
+                if not valid:
+                    return self._error(401, "invalid panel password",
+                                       "invalid_request_error")
             raw = payload.get("identity_versions")
             if not isinstance(raw, dict):
                 return self._error(400, "identity_versions must be an object",
@@ -24067,7 +24113,9 @@ def _bootstrap_runtime(args):
             # 起来，命令行明确要求设密码却被静默忽略 —— fail-open 比启动失败更糟。
             raise SystemExit(
                 "Cannot start: the requested panel password could not be set.") from exc
-    elif wb_settings.panel_password_is_default(ACCOUNTS_DIR):
+    elif PANEL_AUTH_REQUIRED and wb_settings.panel_password_is_default(ACCOUNTS_DIR):
+        # 只在真要密码时提示改默认口令；免密码时紧跟着就是「校验已关闭」，
+        # 两行自相矛盾只会让人以为配置没生效。
         log("panel      : password is still the default 'admin' - change it in the panel")
     if not PANEL_AUTH_REQUIRED:
         log("panel      : password check DISABLED (default; set %s=on to re-enable)"

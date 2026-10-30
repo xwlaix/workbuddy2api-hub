@@ -54,10 +54,16 @@ def check(label, ok, detail=""):
         print("  [FAIL] %s %s" % (label, detail))
 
 
-def rendered(disk_bytes, language):
-    """服务端对文件做的事：把占位替换成实际语言（与 _dashboard 同一语义）。"""
-    return disk_bytes.replace(PLACEHOLDER,
-                              ('data-ui-language="%s"' % language).encode("utf-8"))
+def rendered(disk_bytes, language, auth="off"):
+    """服务端对文件做的事（与 _dashboard 同一语义）：占位 → 语言 + 面板密码模式。
+
+    1.9.6 起首页还会注入 `data-panel-auth`（免密码构建让首帧就不显示登录闸门）。
+    本套件启动的实例没有设 WB_PANEL_AUTH，所以默认就是 "off"。
+    """
+    return disk_bytes.replace(
+        PLACEHOLDER,
+        ('data-ui-language="%s" data-panel-auth="%s"'
+         % (language, auth)).encode("utf-8"))
 
 
 port = life.free_port()

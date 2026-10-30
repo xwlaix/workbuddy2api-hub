@@ -37,9 +37,12 @@ KEY = "panel-auth-off-key"
 MODEL_ID = "injected-panel-auth-off-model"
 
 
+OTHER_MODEL_ID = "injected-other-model"
+
+
 def injected_models(realm=None):
     """The model listing, without walking anything upstream."""
-    return [(MODEL_ID, {"name": "Injected"})]
+    return [(MODEL_ID, {"name": "Injected"}), (OTHER_MODEL_ID, {"name": "Other"})]
 
 
 class StubUpdates(object):
@@ -76,13 +79,14 @@ class DispatchRequest(proxy.Handler):
         self.rfile = io.BytesIO(body)
         self.wfile = io.BytesIO()
         self.status = None
+        self.sent_headers = {}
         self.client_address = ("127.0.0.1", 0)
 
     def send_response(self, code, message=None):
         self.status = code
 
     def send_header(self, key, value):
-        pass
+        self.sent_headers[key] = value
 
     def end_headers(self):
         pass
@@ -113,6 +117,7 @@ class PanelAuthSwitchTests(unittest.TestCase):
     def call(self, path, headers=None, command="GET", body=b"", required=False):
         """跑一次真实分发。required 是本次想验证的 WB_PANEL_AUTH 口径。"""
         request = DispatchRequest(path, headers=headers, command=command, body=body)
+        self.last = request
         with mock.patch.multiple(
                 proxy, ACCOUNTS_DIR=self.directory, API_KEY=None, POOL=None,
                 PRICING=None, UPDATES=self.updates, SCHEDULER=None,
@@ -215,7 +220,93 @@ class PanelAuthSwitchTests(unittest.TestCase):
                                        required=True)
         self.assertEqual(status, 401)
         self.assertIn("panel password required", payload["error"]["message"])
+
+
+    # ------------------- 5) 免密码不能把 API Key 的边界一起拆掉（1.9.6 回归）
+    def test_a_wrong_key_is_still_refused_on_a_read_only_get(self):
+        # 1.9.5 把「匿名 GET 放行」写在 identify_key() 之前，于是带错 Key 的
+        # GET /v1/models 也回 200 —— Key 等于形同虚设。
+        status, payload, _ = self.call("/v1/models",
+                                       {"Authorization": "Bearer wrong-key"},
+                                       required=False)
+        self.assertEqual(status, 401, "wrong key answered %s" % status)
+        self.assertIn("invalid api key", payload["error"]["message"])
+
+    def test_a_valid_key_is_still_identified_on_a_read_only_get(self):
+        # 按 Key 过滤模型依赖 self.key_entry；GET 旁路若提前短路，它永远是 None。
+        wb_settings.set_api_keys(self.directory, [
+            {"id": "k1", "name": "k", "key": KEY, "enabled": True,
+             "models": [MODEL_ID]}])
+        wb_settings.set_filter_models_by_key(self.directory, True)
+
+        status, payload, _ = self.call("/v1/models", required=False)
+        self.assertEqual(status, 200)
+        anon_ids = [m["id"] for m in payload.get("data", [])]
+        self.assertEqual(sorted(anon_ids), sorted([MODEL_ID, OTHER_MODEL_ID]),
+                         "匿名只读应当看到全量目录")
+
+        status, payload, _ = self.call("/v1/models",
+                                       {"Authorization": "Bearer " + KEY},
+                                       required=False)
+        self.assertEqual(status, 200)
+        key_ids = [m["id"] for m in payload.get("data", [])]
+        self.assertEqual(key_ids, [MODEL_ID],
+                         "受限 Key 只应看到它允许的模型，实际 %r" % (key_ids,))
+
+    # ------------------------------- 6) 出站身份版本号：免密时不再要二次密码
+    def test_identity_versions_needs_no_password_when_off(self):
+        body = json.dumps({"identity_versions": {"cli": "9.9.9"}}).encode()
+        status, payload, _ = self.call("/settings/save", command="POST", body=body,
+                                       required=False)
+        self.assertEqual(status, 200, "settings/save answered %s" % status)
+        self.assertEqual(payload.get("identity_versions"), {"cli": "9.9.9"})
+
+    def test_identity_versions_still_needs_the_password_when_gated(self):
+        body = json.dumps({"identity_versions": {"cli": "9.9.9"}}).encode()
+        status, payload, _ = self.call("/settings/save", command="POST", body=body,
+                                       required=True)
+        self.assertEqual(status, 401, "settings/save answered %s" % status)
+
+    # ------------------------- 7) 首帧：免密码时页面壳自己就写着「不用登录」
+    def test_the_dashboard_shell_declares_the_passwordless_mode(self):
+        status, _, raw = self.call("/", required=False)
+        self.assertEqual(status, 200, "GET / answered %s" % status)
+        self.assertIn('data-panel-auth="off"', raw)
+        etag_off = self.last.sent_headers.get("ETag")
+        status, _, raw = self.call("/", required=True)
+        self.assertIn('data-panel-auth="on"', raw)
+        etag_on = self.last.sent_headers.get("ETag")
+        self.assertTrue(etag_off and etag_on and etag_off != etag_on,
+                        "ETag 必须随密码模式变化（否则 304 会把旧壳发回去）："
+                        "%r vs %r" % (etag_off, etag_on))
+
+    # --------------------------------- 8) 免密码后的最低防线：跨站写请求挡掉
+    def test_a_cross_site_write_is_refused(self):
+        status, payload, _ = self.call(
+            "/settings/save", command="POST", body=b"{}",
+            headers={"Origin": "https://evil.example", "Host": "127.0.0.1:8788"},
+            required=False)
+        self.assertEqual(status, 401, "cross-site POST answered %s" % status)
         self.assertIn("panel password required", payload["error"]["message"])
+
+    def test_same_origin_and_script_writes_are_allowed(self):
+        status, _, _ = self.call(
+            "/settings/save", command="POST", body=b"{}",
+            headers={"Origin": "http://127.0.0.1:8788", "Host": "127.0.0.1:8788"},
+            required=False)
+        self.assertEqual(status, 200, "same-origin POST answered %s" % status)
+        # 没有 Origin（curl / Python 脚本 / 单测桩）照常放行
+        status, _, _ = self.call("/settings/save", command="POST", body=b"{}",
+                                 required=False)
+        self.assertEqual(status, 200, "Origin-less POST answered %s" % status)
+
+    def test_a_cross_site_read_is_not_blocked(self):
+        # 只挡写：跨站 GET 拿不到响应体（同源策略在浏览器侧），挡它没有收益。
+        status, _, _ = self.call("/settings",
+                                 headers={"Origin": "https://evil.example",
+                                          "Host": "127.0.0.1:8788"},
+                                 required=False)
+        self.assertEqual(status, 200, "cross-site GET answered %s" % status)
 
 
 if __name__ == "__main__":

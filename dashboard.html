@@ -9,8 +9,10 @@
      登录闸门随首帧一起出现，看板骨架不会被先画出来再盖住。
      有令牌 → 先隐藏闸门，交给 bootPanel() 用 /panel/status 复核；令牌过期或网关
      重启导致复核失败时，panelNeedsLogin() 会摘掉这个类把闸门放回屏幕上。
-     这里必须 !important：闸门的可见性写在它自己的内联 style 上，普通规则压不住。 -->
-<style>html.wb-panel-session #panelGate{display:none!important}</style>
+     这里必须 !important：闸门的可见性写在它自己的内联 style 上，普通规则压不住。
+      第二选择器服务于「面板免密码」的构建：服务端在 <html> 注入 data-panel-auth="off"，
+      此时根本没有登录这回事，闸门连首帧都不该出现（否则每次刷新都闪一下密码框）。 -->
+<style>html.wb-panel-session #panelGate{display:none!important}html[data-panel-auth="off"] #panelGate{display:none!important}</style>
 <script>
 /* 面板会话令牌的存储键。全页只在这里定义一次：首帧判定要用它，所以必须先于
    任何页面内容；后面的脚本直接复用这个绑定，不要再写一遍字面量。 */
@@ -2707,6 +2709,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '连接中断:': 'Connection lost:',
     '连续打卡天数': 'Check-in streak',
     '退出面板登录': 'Sign out of the dashboard',
+    '(已关闭密码校验)': '(password check off)',
     '选择一个账号 JSON 文件。支持本网关导出的文件、账号数组、单个账号对象， 以及桌面客户端的': 'Pick an account JSON file. It accepts files exported by this gateway, an account array, a single account object, and the one of the desktop client',
     '选择要登录的版本：': 'Choose the version to sign in to:',
     '选择颜色主题': 'Choose a color theme',
@@ -5168,7 +5171,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
             </label>
           </div>
           <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px">
-            <label style="font-size:13px;color:var(--dim)">面板密码
+            <label id="setIdentityVersionPwdWrap" style="font-size:13px;color:var(--dim)">面板密码
               <input id="setIdentityVersionPassword" type="password" autocomplete="current-password" style="background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:6px 9px;font:inherit;color:var(--fg)">
             </label>
             <button onclick="saveIdentityVersions(this)">保存版本号</button>
@@ -5709,7 +5712,7 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       </table>
       <div style="margin-top:14px;display:flex;gap:8px;flex-wrap:wrap">
         <button class="sec" onclick="loadSettings(true)">刷新</button>
-        <button class="sec" onclick="panelLogout()">退出面板登录</button>
+        <button class="sec" id="btnPanelLogout" onclick="panelLogout()">退出面板登录</button>
       </div>
     </section>
 
@@ -11597,14 +11600,35 @@ async function saveWinMaxHeight(btn){
 }
 // ==== 面板窗口限高结束 ====
 
+function applyPanelAuthMode(required){
+  // required=false（面板免密码）：出站身份版本号的二次密码框、退出登录按钮
+  // 都是无效控件，服务端也不再校验，直接收起来。
+  const wrap = document.getElementById('setIdentityVersionPwdWrap');
+  if(wrap) wrap.style.display = required ? '' : 'none';
+  const logout = document.getElementById('btnPanelLogout');
+  if(logout) logout.style.display = required ? '' : 'none';
+}
+
 async function loadSettings(showToast){
   try {
     const data = await getJSON('/settings');
     const pwdState = document.getElementById('setPwdState');
-    if(pwdState){
-      pwdState.textContent = data.panel_password_is_default ? '(当前为默认密码)' : '(已自定义)';
-      pwdState.style.color = data.panel_password_is_default ? 'var(--warn)' : 'var(--accent2)';
+    // 免密码构建：/settings 会回报 panel_password_required=false。此时密码相关的
+    // 控件（改密码、二次校验、退出登录）全部是无效控件，收起而不是留着让人试。
+    const pwdRequired = (data.panel_password_required !== false);
+    if(PANEL_STATUS && typeof PANEL_STATUS === 'object'){
+      PANEL_STATUS.panel_password_required = pwdRequired;
     }
+    if(pwdState){
+      if(!pwdRequired){
+        pwdState.textContent = '(已关闭密码校验)';
+        pwdState.style.color = 'var(--dim)';
+      } else {
+        pwdState.textContent = data.panel_password_is_default ? '(当前为默认密码)' : '(已自定义)';
+        pwdState.style.color = data.panel_password_is_default ? 'var(--warn)' : 'var(--accent2)';
+      }
+    }
+    applyPanelAuthMode(pwdRequired);
     const keyState = document.getElementById('setKeyState');
     if(keyState){
       const count = (data.api_keys || []).filter(k => k.enabled).length;
@@ -12571,7 +12595,9 @@ function toggleIdentityVersionEditor(){
 async function saveIdentityVersions(btn){
   const passwordEl = document.getElementById('setIdentityVersionPassword');
   const password = String((passwordEl && passwordEl.value) || '');
-  if(!password){ toast('请输入面板密码', 'warn'); return; }
+  // 免密码构建下服务端不再校验这一项的二次密码；本地也不该拦住请求。
+  const pwdRequired = !(PANEL_STATUS && PANEL_STATUS.panel_password_required === false);
+  if(pwdRequired && !password){ toast('请输入面板密码', 'warn'); return; }
   const versions = {};
   IDENTITY_VERSION_FIELDS.forEach(function(item){
     const el = document.getElementById(item[2]);
@@ -12580,7 +12606,9 @@ async function saveIdentityVersions(btn){
   });
   if(btn) btn.disabled = true;
   try {
-    await postJSON('/settings/save', {identity_versions: versions, panel_password: password});
+    const body = {identity_versions: versions};
+    if(pwdRequired) body.panel_password = password;
+    await postJSON('/settings/save', body);
     toast('出站身份版本号已保存', 'ok');
     if(passwordEl) passwordEl.value = '';
     const editor = document.getElementById('identityVersionEditor');

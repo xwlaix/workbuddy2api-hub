@@ -12,6 +12,11 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# PasswordGateTests 钉的是「要面板密码时，保存身份版本号必须带对密码」。
+# 本机构建的 WB_PANEL_AUTH 默认已翻成 off（免密码，这一项随之放开），所以这里
+# 显式打开开关 —— 必须在 import wb_proxy 之前设，模块级常量是导入时算的。
+os.environ["WB_PANEL_AUTH"] = "on"
+
 import wb_identity
 import wb_accounts
 import wb_proxy
