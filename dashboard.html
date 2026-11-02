@@ -2710,6 +2710,11 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
     '连续打卡天数': 'Check-in streak',
     '退出面板登录': 'Sign out of the dashboard',
     '(已关闭密码校验)': '(password check off)',
+    '单请求体上限': 'Max request body size',
+    '超限时可临时调高后重试压缩请求；调高会增加并发请求的内存占用。保存后立即生效。':
+      'Raise it temporarily when a compressed request is rejected; a larger limit costs more memory for concurrent requests. Takes effect immediately.',
+    '请输入 1 到 256 的整数 MB': 'Enter a whole number of MB between 1 and 256',
+    '单请求体上限已保存': 'Max request body size saved',
     '选择一个账号 JSON 文件。支持本网关导出的文件、账号数组、单个账号对象， 以及桌面客户端的': 'Pick an account JSON file. It accepts files exported by this gateway, an account array, a single account object, and the one of the desktop client',
     '选择要登录的版本：': 'Choose the version to sign in to:',
     '选择颜色主题': 'Choose a color theme',
@@ -5570,27 +5575,6 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
               启用更稳的会话键
             </label>
             <button onclick="saveAffinityStableKey(this)">保存</button>
-          </div>
-        </div>
-      </section>
-
-      <section>
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px">
-          <div>
-            <h2 style="margin:0">上游响应头超时 <em id="setHeaderTimeoutState"></em></h2>
-            <div style="font-size:12px;color:var(--dim);margin-top:4px">
-              单次尝试等上游返回响应头的上限（秒）。拿到响应头之前网关不会向客户端发出任何字节，所以这个值就是客户端要空等的时长：设得比客户端的首字节预算还大时，客户端会先断开（表现为 499 / 首字节迟迟不返回），而网关仍会按这个上限继续换账号重试。默认 120。
-            </div>
-            <div style="font-size:12px;color:var(--warn);margin-top:4px">
-              调小的代价：上游偶尔确实算得慢的正常请求会被提前判失败、换账号重试，多消耗一次额度。建议不高于客户端的首字节预算。
-            </div>
-          </div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end">
-            <label style="display:flex;align-items:center;gap:6px;font-size:13px;min-height:40px">
-              <input id="setHeaderTimeout" type="number" min="1" step="1" style="width:90px">
-              秒
-            </label>
-            <button onclick="saveHeaderTimeout(this)">保存</button>
           </div>
         </div>
       </section>
@@ -13159,8 +13143,8 @@ async function saveUsageKeep(btn){
     if(btn) btn.disabled = false;
   }
 }
-/* 上游响应头超时。后端只接受 >=1 的整数秒，所以先把输入收成整数再发：空值、
-   小数、非数字就地拦下，而不是送上去换一个 400 回来。 */
+/* 单请求体上限（MB）。后端只接受 1..256 的整数，所以本地先校验范围：
+   空值、小数、越界就地拦下，而不是送上去换一个 400 回来。 */
 async function saveMaxPayload(btn){
   const el = document.getElementById('setMaxPayloadMB');
   const value = Number(el && el.value);
@@ -13173,6 +13157,8 @@ async function saveMaxPayload(btn){
   } catch(e) { toast('保存失败: ' + e.message, 'bad'); }
   finally { if(btn) btn.disabled = false; }
 }
+/* 上游响应头超时。后端只接受 >=1 的整数秒，所以先把输入收成整数再发：空值、
+   小数、非数字就地拦下，而不是送上去换一个 400 回来。 */
 async function saveHeaderTimeout(btn){
   const el = document.getElementById('setHeaderTimeout');
   const value = Math.floor(Number(el && el.value));
@@ -14426,7 +14412,7 @@ function renderProxySlots(){
     + PROXY_SLOTS.map((s, i) =>
         '<tr>'
         + '<td data-label="名称"><input value="' + esc(s.name || '') + '" placeholder="' + esc(s.label || '') + '" oninput="PROXY_SLOTS[' + i + '].name=this.value; markSlotsDirty()" class="slot-input"></td>'
-        + '<td data-label="代理地址"><input value="' + esc(s.url || '') + '" oninput="PROXY_SLOTS[' + i + '].url=this.value; markSlotsDirty()" class="slot-input mono"></td>'
+        + '<td data-label="代理地址"><input value="' + esc(s.url || '') + '" placeholder="http://user:pass@127.0.0.1:8080" oninput="PROXY_SLOTS[' + i + '].url=this.value; markSlotsDirty()" class="slot-input mono"></td>'
         + '<td data-label="出口">' + slotExitHtml(s) + '</td>'
         + '<td style="text-align:center" data-label="启用" data-col="enabled"><input type="checkbox" ' + (s.enabled === false ? '' : 'checked')
         +   ' onchange="PROXY_SLOTS[' + i + '].enabled=this.checked; markSlotsDirty()"></td>'

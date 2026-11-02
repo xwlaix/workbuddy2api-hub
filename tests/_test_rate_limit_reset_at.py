@@ -47,7 +47,11 @@ MODEL = "deepseek-v4.1-flash"
 # StaleWallClockTests 在钉的行为），于是这三条用例在 2026-11-02 09:35 之后
 # 必然变红——测试时间炸弹，不是实现问题。
 _RESET_AT = int(time.time()) + 3600
-_RESET_STAMP = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_RESET_AT))
+# 必须按**东八区**格式化，且不能依赖宿主时区：下面两条正文里写死了 UTC+8，
+# 用 time.localtime() 在 UTC 机器（CI 的 ubuntu runner、没配 TZ 的容器）上
+# 会产出 UTC 墙钟，被 parse_rate_limit_reset 按 +8 解算后落到 7 小时前，
+# _usable_reset_epoch 直接丢掉 → 用例整片红。gmtime(epoch+8h) 恒定产出东八区墙钟。
+_RESET_STAMP = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(_RESET_AT + 8 * 3600))
 DETAIL_EN = ("usage exceeds frequency limit, but don't worry, your usage will "
              "reset at %s UTC+8" % _RESET_STAMP)
 DETAIL_CN = "您的使用量已超出频率限制，将在 %s UTC+8 重置" % _RESET_STAMP
@@ -57,11 +61,13 @@ class HeaderHelperTests(unittest.TestCase):
     """纯函数：头怎么拼，拿不到时刻时怎么退避。"""
 
     def test_both_absolute_headers_are_emitted(self):
-        headers = dict(P.rate_limit_headers(1793600000))
-        self.assertEqual(headers["X-RateLimit-Reset"], "1793600000")
+        # 时刻必须动态生成：写死 1793600000（2026-11-02T06:13:20Z）会在那一刻
+        # 之后被 _usable_reset_epoch 判成陈旧墙钟，两条用例在所有环境确定性变红。
+        headers = dict(P.rate_limit_headers(_RESET_AT))
+        self.assertEqual(headers["X-RateLimit-Reset"], str(_RESET_AT))
         self.assertEqual(headers["X-RateLimit-Reset-At"],
                          time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                       time.gmtime(1793600000)))
+                                       time.gmtime(_RESET_AT)))
 
     def test_no_instant_means_no_headers(self):
         """宁可不说，也不能编一个恢复时刻出来。"""
@@ -74,8 +80,10 @@ class HeaderHelperTests(unittest.TestCase):
 
     def test_note_is_empty_without_an_instant(self):
         self.assertEqual(P.rate_limit_reset_note(None), "")
-        self.assertIn("resets at 2026-11-02T",
-                      P.rate_limit_reset_note(1793600000))
+        # 同样不能写死日期：note 内部会过 _usable_reset_epoch，过期的时刻返回空串。
+        self.assertIn("resets at %s" % time.strftime("%Y-%m-%dT",
+                                                     time.gmtime(_RESET_AT)),
+                      P.rate_limit_reset_note(_RESET_AT))
 
 
 class ResetSourceTests(unittest.TestCase):
