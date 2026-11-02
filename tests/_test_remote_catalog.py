@@ -45,20 +45,20 @@ def payload(ids, meta=None):
 
 INTL_IDS = [
     "default-model", "fast-model", "balanced-model", "primary-model",
-    "deep-model", "hy4-preview-f", "hy3", "deepseek-v4.1-flash",
-    "deepseek-v4.1-flash-sg", "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra",
-    "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "grok-4.7", "gemini-3.5-flash",
-    "glm-5.3-flash", "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.6",
-    "kimi-k2.8-preview",
+    "deep-model", "hy4-preview", "hy3", "deepseek-v4.1-flash-sg",
+    "gpt-6-astra", "gpt-6-sol", "gpt-5.6-sol", "gpt-5.6-terra",
+    "gpt-5.6-luna", "grok-4.7", "gemini-3.8-flash",
+    "glm-5.3-flash", "glm-5.3", "kimi-k3", "kimi-k3.1-pro",
+    "minimax-m3.1-flash",
 ]
 INTL_META = {
-    "deepseek-v4.1-flash": {"credits": "x0.00"},
-    "deepseek-v4.1-flash-sg": {"credits": "x0.03"},
-    "hy4-preview-f": {"credits": "x0.00"},
+    # -sg 是付费变体：同名的免费基名已从上游目录下线（2026-11），
+    # 目录里只剩 -sg，于是它自己就是对外宣告的那一个。
+    "deepseek-v4.1-flash-sg": {"credits": "x0.11"},
     "hy4-preview": {"credits": "x0.29"},
     "grok-4.7": {"credits": "x1.90"},
     "hy3": {"credits": "x0.00"},
-    "glm-5.3": {"credits": "x0.79"},
+    "glm-5.3": {"credits": "x0.69"},
 }
 
 CN_IDS = [
@@ -100,29 +100,30 @@ class RemoteCatalogTests(unittest.TestCase):
         """
         # 1. The endpoint declares a new price for a curated model: it wins.
         meta = dict(INTL_META)
-        meta["hy4-preview-f"] = {"credits": "x0.29"}
+        meta["glm-5.3"] = {"credits": "x0.55"}
         P.fetch_remote_product_config = (
             lambda realm: (INTL_IDS, meta) if realm == "intl" else None)
         entries = dict(P.fetch_models("intl"))
-        self.assertEqual(entries["hy4-preview-f"]["credits"], "x0.29")
+        self.assertEqual(entries["glm-5.3"]["credits"], "x0.55")
         self.assertEqual(
-            P.model_entry("hy4-preview-f", entries["hy4-preview-f"])["credits"],
-            "x0.29")
+            P.model_entry("glm-5.3", entries["glm-5.3"])["credits"],
+            "x0.55")
 
         # 2. The endpoint stops listing it: the bundled value survives, and that
-        #    is exactly what the panel then shows.
-        ids = [m for m in INTL_IDS if m != "hy4-preview-f"]
+        #    is exactly what the panel then shows. hy4-preview is the sample:
+        #    the international catalogue still bundles it.
+        ids = [m for m in INTL_IDS if m != "hy4-preview"]
         meta = dict(INTL_META)
-        meta.pop("hy4-preview-f", None)
+        meta.pop("hy4-preview", None)
         P.fetch_remote_product_config = (
             lambda realm: (ids, meta) if realm == "intl" else None)
         P._models_cache["intl"] = {"at": 0.0, "data": None}
         entries = dict(P.fetch_models("intl"))
-        self.assertIn("hy4-preview-f", entries)
-        self.assertEqual(entries["hy4-preview-f"]["credits"], "x0.00")
+        self.assertIn("hy4-preview", entries)
+        self.assertEqual(entries["hy4-preview"]["credits"], "x0.29")
         self.assertEqual(
-            P.model_entry("hy4-preview-f", entries["hy4-preview-f"])["credits"],
-            "x0.00")
+            P.model_entry("hy4-preview", entries["hy4-preview"])["credits"],
+            "x0.29")
 
     def test_parse_keeps_order_and_metadata(self):
         ids, meta = P.parse_remote_catalog(payload(INTL_IDS, INTL_META))
@@ -143,9 +144,11 @@ class RemoteCatalogTests(unittest.TestCase):
         curated = P.curate_remote_catalog("intl", INTL_IDS, INTL_META)
         self.assertEqual(curated, [m for m in INTL_IDS if m not in (
             "default-model", "fast-model", "balanced-model", "primary-model",
-            "deep-model", "deepseek-v4.1-flash-sg")])
+            "deep-model")])
         self.assertIn("grok-4.7", curated)
-        self.assertIn("hy4-preview-f", curated)
+        self.assertIn("hy4-preview", curated)
+        # -sg 没有免费的同名基名在目录里，于是它自己保留（付费档照常对外）。
+        self.assertIn("deepseek-v4.1-flash-sg", curated)
 
     def test_curate_prefers_the_free_sibling(self):
         ids = ["hy4-preview", "hy4-preview-f", "hy3", "hy3-x"]
@@ -165,11 +168,14 @@ class RemoteCatalogTests(unittest.TestCase):
         P.fetch_remote_product_config = (
             lambda realm: (INTL_IDS, INTL_META) if realm == "intl" else None)
         ids = [m for m, _ in P.fetch_models("intl")]
+        # 顺序由 INTL_UI_ORDER 决定；模型名不在本次 live 目录里的（如
+        # gpt-6.1-sol、kimi-k3.1-pro-highspeed）由内置快照补进来，所以也出现。
         self.assertEqual(ids, [
-            "hy4-preview-f", "hy3", "deepseek-v4.1-flash", "gpt-6-astra",
-            "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
-            "gpt-5.4", "grok-4.7", "gemini-3.5-flash", "glm-5.3-flash",
-            "glm-5.3", "glm-5.2", "kimi-k3", "kimi-k2.6", "kimi-k2.8-preview"])
+            "deepseek-v4.1-flash-sg", "hy4-preview", "hy3", "gpt-6-astra",
+            "gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol",
+            "gpt-5.6-terra", "gpt-5.6-luna", "grok-4.7", "gemini-3.8-flash",
+            "glm-5.3", "glm-5.3-flash", "kimi-k3.1-pro",
+            "kimi-k3.1-pro-highspeed", "kimi-k3", "minimax-m3.1-flash"])
 
     def test_cn_keeps_the_pinned_free_variant(self):
         # 实时 meta 为准：上游已下线 hy4-preview-f 且 hy4-preview 为收费 (0.29x) 时，如实对外宣告 hy4-preview
@@ -201,32 +207,26 @@ class RemoteCatalogTests(unittest.TestCase):
     def test_live_reasoning_efforts_win_over_the_bundled_table(self):
         """The endpoint's reasoning block is the source of truth.
 
-        deepseek-v4.1-flash used to be pinned to low/high/max in code, which
+        deepseek-v4.1-flash-sg used to be pinned to low/high/max in code, which
         silently overwrote whatever the live catalogue declared (the pin dates
         from before the gateway called /v3/config at all).
         """
         meta = dict(INTL_META)
-        meta["deepseek-v4.1-flash"] = {
-            "credits": "x0.00",
+        meta["deepseek-v4.1-flash-sg"] = {
+            "credits": "x0.11",
             "reasoning": {"supportedEfforts": ["low", "medium", "high"],
                           "defaultEffort": "medium"},
         }
         P.fetch_remote_product_config = (
             lambda realm: (INTL_IDS, meta) if realm == "intl" else None)
         entries = dict(P.fetch_models("intl"))
-        item = P.model_entry("deepseek-v4.1-flash",
-                             entries["deepseek-v4.1-flash"])
+        item = P.model_entry("deepseek-v4.1-flash-sg",
+                             entries["deepseek-v4.1-flash-sg"])
         self.assertEqual(item["reasoning_efforts"], ["low", "medium", "high"])
         self.assertEqual(item["reasoning_default_effort"], "medium")
 
-    def test_a_silent_live_entry_advertises_no_levels(self):
-        """A silent live entry still falls back to the snapshot for the merge.
-
-        §D5 改了**对外声明**那一侧：live 明确知道这个模型却没声明档位时，
-        /v1/models 一档都不广告（否则客户端选 max、实际跑 high）。合并块本身
-        不变，面板/推测值仍然拿得到快照补出来的三档，所以这里继续断言
-        merge 的兜底日志。
-        """
+    def test_bundled_efforts_fill_in_when_the_live_entry_has_none(self):
+        """A silent live entry falls back to the snapshot, and says so once."""
         logged = []
         original_log = P.log
         P.log = lambda message, **kw: logged.append(message)
@@ -237,24 +237,24 @@ class RemoteCatalogTests(unittest.TestCase):
             entries = dict(P.fetch_models("intl"))
         finally:
             P.log = original_log
-        item = P.model_entry("deepseek-v4.1-flash",
-                             entries["deepseek-v4.1-flash"])
-        self.assertNotIn("reasoning_efforts", item)
-        self.assertNotIn("reasoning_default_effort", item)
+        item = P.model_entry("deepseek-v4.1-flash-sg",
+                             entries["deepseek-v4.1-flash-sg"])
+        self.assertEqual(item["reasoning_efforts"], ["low", "high", "max"])
+        self.assertEqual(item["reasoning_default_effort"], "high")
         self.assertTrue(any("bundled table" in m for m in logged), logged)
 
-    def test_a_bare_live_effort_is_advertised_as_that_single_level(self):
-        """Issue #170 revisited (§D5): advertise exactly what will actually run.
+    def test_bare_live_effort_keeps_the_model_selectable(self):
+        """Issue #170: a bare live `effort` is the default, not a pin.
 
-        The endpoint answers {"effort": "high"} for deepseek-v4.1-flash. 出站放行
-        只认 live 声明过的那一份（_enforce_live_effort），所以客户端发 max 时真正
-        跑的是 high；过去 /v1/models 却用内置快照补出的 low/high/max 去广告，
-        客户端因此能选一个不会生效的档位。现在两边同源：只广告 high，且发 max
-        的请求在出站时收敛到 high。
+        The endpoint answers with {"effort": "high"} for deepseek-v4.1-flash-sg
+        while the bundled table knows the level is selectable. Taking the live
+        block at face value dropped supportedEfforts, so /v1/models advertised
+        the model as pinned to high - and every request was recorded at high
+        even when the client sent max, the level it was really forwarded with.
         """
         meta = dict(INTL_META)
-        meta["deepseek-v4.1-flash"] = {
-            "credits": "x0.00",
+        meta["deepseek-v4.1-flash-sg"] = {
+            "credits": "x0.11",
             "reasoning": {"effort": "high", "summary": "auto"},
         }
         logged = []
@@ -267,22 +267,22 @@ class RemoteCatalogTests(unittest.TestCase):
             entries = dict(P.fetch_models("intl"))
         finally:
             P.log = original_log
-        item = P.model_entry("deepseek-v4.1-flash",
-                             entries["deepseek-v4.1-flash"])
-        self.assertEqual(item["reasoning_efforts"], ["high"])
+        item = P.model_entry("deepseek-v4.1-flash-sg",
+                             entries["deepseek-v4.1-flash-sg"])
+        self.assertEqual(item["reasoning_efforts"], ["low", "high", "max"])
         self.assertEqual(item["reasoning_default_effort"], "high")
-        self.assertEqual(item["reasoning_fixed_effort"], "high")
-        # 同一份口径：声明只有 high，出站也把 max 收敛到 high（不再"声明一套、跑一套"）。
-        self.assertIsNone(P.model_fixed_effort("deepseek-v4.1-flash"))
-        wire = P._enforce_live_effort({"reasoning_effort": "max"},
-                                      "reasoning_effort", "max",
-                                      "deepseek-v4.1-flash")
-        self.assertEqual(wire["reasoning_effort"], "high")
-        # A model the live catalogue does not describe at all is not advertised
-        # either: 内置快照给 gemini-3.5-flash 的那个固定 medium 只留在面板上
-        # （推测/提示用），对外声明一档都不说。
-        pinned = P.model_entry("gemini-3.5-flash", entries["gemini-3.5-flash"])
-        self.assertNotIn("reasoning_fixed_effort", pinned)
+        self.assertNotIn("reasoning_fixed_effort", item)
+        # The level the request really ran at follows the client again.
+        self.assertIsNone(P.model_fixed_effort("deepseek-v4.1-flash-sg"))
+        self.assertEqual(
+            P.upstream_effort_of({"reasoning_effort": "max"},
+                                 "deepseek-v4.1-flash-sg"),
+            "max")
+        # A model the live catalogue really does pin is untouched: no snapshot
+        # supportedEfforts to restore, so its bare effort still pins it.
+        # kimi-k3 is the pinned sample in the current catalogue.
+        pinned = P.model_entry("kimi-k3", entries["kimi-k3"])
+        self.assertEqual(pinned["reasoning_fixed_effort"], "medium")
         self.assertNotIn("reasoning_efforts", pinned)
         # And the shape is announced, not applied silently.
         self.assertTrue(any("bundled table" in m for m in logged), logged)
