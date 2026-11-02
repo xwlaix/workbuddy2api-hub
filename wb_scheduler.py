@@ -536,11 +536,28 @@ class Scheduler:
                     if blocked:
                         self.log(f"跳过受限账号 [{uid8}] 的猫猫旅行与连登管家：{blocked}")
                     else:
-                        # 检查猫猫旅行
+                        # 猫猫旅行 + Buddy 盲盒（上游 937c179）：claim 之后往往还能
+                        # 再 depart 一次，两次之间先把盲盒开了；depart 单独走一支。
                         tr = do_cat_travel(acc)
-                        if tr.get("action") in ("claim", "depart"):
+                        if tr.get("action") == "claim":
                             travel_count += 1
                             self.log(f"🐱 账号 [{uid8}] 猫猫日常处理: {tr.get('msg')}")
+                            time.sleep(1.0)
+                            bo = wb_tasks.do_buddy_open(acc)
+                            if bo.get("action") == "open":
+                                self.log(f"🎁 账号 [{uid8}] {bo.get('msg')}")
+                                time.sleep(1.0)
+                            tr2 = do_cat_travel(acc)
+                            if tr2.get("action") == "depart":
+                                self.log(f"🐱 账号 [{uid8}] 猫猫日常处理: {tr2.get('msg')}")
+                        elif tr.get("action") == "depart":
+                            travel_count += 1
+                            self.log(f"🐱 账号 [{uid8}] 猫猫日常处理: {tr.get('msg')}")
+                        else:
+                            bo = wb_tasks.do_buddy_open(acc)
+                            if bo.get("action") == "open":
+                                self.log(f"🎁 账号 [{uid8}] {bo.get('msg')}")
+                                time.sleep(1.0)
                         time.sleep(1.0)
 
                         # 连登管家闭环（补签保连登 -> 礼包/补偿 -> 连登兑换 -> 自动抽奖）

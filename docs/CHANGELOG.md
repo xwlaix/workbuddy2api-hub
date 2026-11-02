@@ -1,3 +1,67 @@
+## v1.10.4
+
+国内版成长任务全能引擎与 Buddy 盲盒自动化扩展，并致谢社区开源项目：
+
+- **开源致谢与架构对齐**：
+  - 本模块任务事件模型、小程序专属埋点指纹与动态专家解析参考并致谢开源项目 [L0NE-6/WorkBuddy-Daily](https://github.com/L0NE-6/WorkBuddy-Daily)（MIT License）。
+  - 猫猫旅行与成长能量开盲盒（Buddy 盲盒）安全生命周期参考并致谢开源项目 [88lin/workbuddy-auto-signin](https://github.com/88lin/workbuddy-auto-signin)（MIT License）。
+- **补齐官方新增任务支持**：新增工作台搭建师（workstation_expert）、中国电商运营专家（xpert_use_maidehao）、抖音策略师（xpert_use_douyinyin）、商家宣传设计师（xpert_use_shangjia_xuanchuan）、直播电商教练（xpert_use_bowangwang）、PC灵感功能（Sequential_Tasks_7）。
+- **动态专家深链解析**：遇到未预录入但上游临时下发的专家类任务（如带有 jump_url / deeplink），自动提取真实专家 ID（x_xxx）并构造 xpert_actual_use 事件推进进度，避免上游新增专家任务时被漏掉。
+- **解除资料库与桌面对话的跳过限制**：体验资料库（Library_read）接入官方文档点击事件（web_element_click）上报点亮；桌面对话（RichMeow_Chat）接入 6 连桌面端对话事件链点亮并领奖。
+- **成长能量自动开 Buddy 盲盒（do_buddy_open）**：检测到猫猫空闲或旅行归来领奖后，自动调用 /v2/activity/growth/buddy/quota 查询可开数量，并调用 /v2/activity/growth/buddy/open 开出宠物，消耗闲置能量；领奖后自动衔接开盒并立即派出新一轮旅行。
+- **微信小程序链式成长任务自动化**：支持使用小程序专属标头（X-Client-Platform: miniprogram）与埋点指纹（workbuddy-mp）对 Sequential_Tasks_1 ~ Sequential_Tasks_6 以及校园日活动进行扫描、接取、事件上报与领奖。
+
+## v1.10.3
+
+- **同步国际版模型目录与计费快照到上游现状**（#738 / #739）：对齐上游最新模型发布与下线，对话模型由 24 项收敛至 22 项；新增 `deepseek-v4.1-flash-sg`（x0.11）、`gpt-6.1-sol`（x1.33）、`gpt-6-sol`（x1.33）、`gpt-6-luna`（x0.07）、`gemini-3.8-flash`（x0.95）、`kimi-k3.1-pro`（x0.97）、`kimi-k3.1-pro-highspeed`（x1.56）、`minimax-m3.1-flash`（x0.08）；移除上游已下线的旧版本模型；排除纯生图/生视频模型（`hy-image-3.5`、`kling-video-v3`）；修复 `-sg` 变体在无同名基名时被丢弃的问题；修复时段定价跨午夜窗口失效问题。
+- **修复 CodeArts OAuth 浏览器回调必然失败**（#735）：支持将华为云 OAuth 回调携带的 `state`（含 `<hex>.pkg` 与裸 hex）精确匹配为会话标识 `ticket_id`，修复浏览器授权回调必然报「缺少会话标识」导致无法添加账号的问题。
+- **修复 CodeArts 非流式请求提前归还账号并发竞争**（#740）：在非流式聚合完成后立即在 finally 中调用 `upstream.close()` 归还账号并发，并在 `open_chat` 遇瞬时并发占满时增加缓冲等待，消除背靠背请求偶发 502 的竞态。
+- **429 恢复时刻测试夹具解耦**（#737）：将 429 恢复时刻测试夹具从写死固定日期改为基于运行时钟动态推算，消除发布次日因时刻过期引发的测试失败。
+
+验证：
+- 本地完整测试矩阵：247 个套件全部通过（184 Python + 63 JS，`247 passed, 0 failed, 0 skipped`）。
+- 发布工程套件 `_test_release_engineering.py` 与发布资产套件 `_test_release_assets.py` 全部通过。
+
+## v1.10.1
+
+- **429 响应附带绝对恢复时刻**（#720）：429 响应带上 `X-RateLimit-Reset`（epoch 秒）与 `X-RateLimit-Reset-At`（ISO-8601 UTC），正文附带 `reset_at` 字段；优先提取上游 6004 正文的真实墙钟，未携带时按网关统一冷却窗口换算，解决多进程/分布式客户端相对时间漂移。
+- **工具归一化过滤非法 function.name**（#726）：`normalize_tools` 自动过滤不符合 `^[A-Za-z0-9_-]{1,64}$` 命名规范的工具，丢弃无 function 载荷的服务端工具声明（如 `web_search`），修复上游 400 / 11133（`tools[N].function.name` 校验失败）。
+- **CodeArts 会话上限与排队修复**（#723）：CodeArts 请求补充发送 `x-ot-session-id`、`user-session-id`（账号级稳定散列）与每请求随机 `x-ot-trace-id`，解决华为云将连续请求误判为并发新建会话导致触碰 3 会话上限、出现 `TM.00001041` 报错与 90 秒排队阻塞的问题。
+- **账号代理槽支持账号密码认证与格式自动规整**（#648）：代理槽完整支持带认证的 `http://user:password@host:port` 代理（出站连接池与代理隧道自动注入 `Proxy-Authorization: Basic`），并对服务商常见的 `host:port:user:pass` 格式与缺失 scheme 的代理自动清洗归整。
+
+验证：
+- 本地完整测试矩阵：246 个套件全部通过（183 Python + 63 JS，`246 passed, 0 failed, 0 skipped`）。
+- 发布工程套件 `_test_release_engineering.py` 与发布资产套件 `_test_release_assets.py` 全部通过。
+
+## v1.10.0
+
+- **CodeArts 原生第三出口（单进程）**（#712 / #715）：新增 `codearts` 原生出口，看板可在「国际版 / 国内版 / CodeArts」三区域间自由切换；`/v1/models`、`/v1/chat/completions`、`/v1/responses` 与 Anthropic Messages 均直连华为云 CodeArts。进程内完整实现 OAuth2 PKCE + DPoP、token 自动续期轮转、账号池并发与冷却管理、内置与限时福利模型发现、聊天 SSE 协议转换与每日签到/积分查询，不再需要单独运行 codearts2api 服务；华为凭据不出本机，默认关闭。
+- **CodeArts 账号代理槽与统一出站连接池**（#712 / #715）：CodeArts 账号复用与 WorkBuddy 一致的出口代理槽，支持连接复用、代理认证及账号级出口独立绑定，槽位变更自动跟随，失效自动回退直连。
+- **CodeArts 权限安全与首帧增强**（#715）：修复 CodeArts 文本流首帧规范化转换；对暂不支持的视觉/图片输入主动拦截并回退 400 明确提示；严格校验 API Key 的模型禁用、白名单与账号绑定范围；OAuth 回调严格校验会话标识并限制跳转安全。
+- **Key 允许账号选择器展示与搜索备注**（#708 / #717）：API Key 编辑弹窗内的允许账号选择器中补充账号备注展示，并支持在搜索框内直接按备注筛选，便于大规模账号池精细化权限配置。
+- **今日活动状态区分「无本地记录」**（#706 / #716）：网关当天缺少加油站或成长计划活动流水时，状态胶囊精准展示为「无本地记录」，避免外部打卡已被上游记录却被本地误报为「未签到」。
+- **单请求体上限面板动态调节**（#709 / #714）：设置页支持将 HTTP 请求体限制在 1–256 MB 范围内动态热配置并立即生效；超限返回清晰的 413 状态并提示当前限额；超限分块传输自动提前熔断，避免无谓占用上行带宽。
+- **修复设置页出现两张「上游响应头超时」卡片**（#710）：清除设置页重复的 DOM 节点，解决第二张卡片数据未回填以及点击保存时读取首张卡片数值的逻辑串扰。
+- **看板「最近请求」的时间补上日期**（#700 / #713）：数据看板的实时请求流水列表在跨天时智能显示 `MM-DD HH:MM`，当日请求保持 `HH:MM:SS`，时间戳缺失显示占位符号 `—`。
+
+验证：
+- 本地完整测试矩阵：244 个套件全部通过（181 Python + 63 JS，`244 passed, 0 failed, 0 skipped`）。
+- GitHub Actions 跨平台 CI（Ubuntu 3.9 / Ubuntu 3.12 / Windows 3.12 / revert guard）全部通过。
+- 发布工程套件 `_test_release_engineering.py` 与发布资产套件 `_test_release_assets.py` 全部通过。
+
+## v1.9.2
+
+- 数据看板在同一时间范围的请求尚未完成时跳过重复轮询，避免慢请求堆积（#656）；首次冷计算仍需扫描历史数据。
+- 更新卡片直接显示安装按钮不可用的原因，以及可安装时的操作提示（#696）。
+- 面板密码加密组件不可用时显示环境错误（#658）；启动时指定的面板密码无法设置则退出，避免意外启用旧密码或默认密码。
+
+## v1.9.1
+
+- **SSE 终态停止读取**（#692）：设置 `WB_STOP_AT_SSE_DONE=1` 后，在聚合、Responses 和 Chat 路径遇到 `[DONE]` 时停止读取；默认关闭。
+- **HTTP 错误正文缓存**（#693）：设置 `WB_CACHE_HTTP_ERROR_BODY=1` 后缓存首次读取的错误正文，供后续读取；缓存最多保留首次读取的字节数，默认关闭。
+
+验证：完整测试套件 233 通过；隔离面板登录、控制台和真实上游请求通过。
+
 ## v1.9.0
 
 本版汇总 `v1.8.0` 之后的十个社区 PR，修复 APISIX 401 挑战头判定、DSH 11128 渠道指纹、收费模型 6004 跨重启持久化、池空 503/429 报错精准归因与用量行对齐、/health 区域与模型细分、零费率模型保留额度豁免、国际版每日活跃 11140 风控持久化避让，以及看板下拉与活动记录窄屏布局优化。套件 231 个（172 Python + 59 JS）。
