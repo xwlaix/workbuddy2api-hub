@@ -20,7 +20,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=workbuddy2api
-PKG_VERSION:=1.9.6
+PKG_VERSION:=1.9.7
 PKG_RELEASE:=1
 
 PKG_LICENSE:=MIT
