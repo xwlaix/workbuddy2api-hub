@@ -414,6 +414,20 @@ class Scheduler:
         finally:
             self._run_lock.release()
 
+    def _step_blocked(self, acc, uid8, what):
+        """子步骤出站前的复查：上一步可能刚落盘受限，别顶风再打一次。
+
+        `_blocked_reason` 只在「进入账号 turn」和「每个子任务」判；而上游
+        937c179 把猫猫旅行改成了 claim → 盲盒 → depart 的串联分支，一条分支里
+        连着出站好几次，中间任何一次撞 403 都会落盘 restrictedUntil，但后面的
+        子步骤照旧会打过去。这里把串联分支内部也补上同一道判定。
+        """
+        reason = self._blocked_reason(acc)
+        if reason:
+            self.log(f"跳过受限账号 [{uid8}] 的{what}：{reason}")
+            return True
+        return False
+
     def _blocked_reason(self, acc):
         """这个账号此刻不该出站的原因；空串 = 可以出站。
 
@@ -543,21 +557,25 @@ class Scheduler:
                             travel_count += 1
                             self.log(f"🐱 账号 [{uid8}] 猫猫日常处理: {tr.get('msg')}")
                             time.sleep(1.0)
-                            bo = wb_tasks.do_buddy_open(acc)
-                            if bo.get("action") == "open":
-                                self.log(f"🎁 账号 [{uid8}] {bo.get('msg')}")
-                                time.sleep(1.0)
-                            tr2 = do_cat_travel(acc)
-                            if tr2.get("action") == "depart":
-                                self.log(f"🐱 账号 [{uid8}] 猫猫日常处理: {tr2.get('msg')}")
+                            if not self._step_blocked(acc, uid8, "Buddy 盲盒"):
+                                bo = wb_tasks.do_buddy_open(acc)
+                                if bo.get("action") == "open":
+                                    self.log(f"🎁 账号 [{uid8}] {bo.get('msg')}")
+                                    time.sleep(1.0)
+                            if not self._step_blocked(acc, uid8, "猫猫二次旅行"):
+                                tr2 = do_cat_travel(acc)
+                                if tr2.get("action") == "depart":
+                                    self.log(f"🐱 账号 [{uid8}] 猫猫日常处理: {tr2.get('msg')}")
                         elif tr.get("action") == "depart":
                             travel_count += 1
                             self.log(f"🐱 账号 [{uid8}] 猫猫日常处理: {tr.get('msg')}")
                         else:
-                            bo = wb_tasks.do_buddy_open(acc)
-                            if bo.get("action") == "open":
-                                self.log(f"🎁 账号 [{uid8}] {bo.get('msg')}")
-                                time.sleep(1.0)
+                            # 旅行失败（含刚撞 403 落盘）时也要先复查，别顺手开盒。
+                            if not self._step_blocked(acc, uid8, "Buddy 盲盒"):
+                                bo = wb_tasks.do_buddy_open(acc)
+                                if bo.get("action") == "open":
+                                    self.log(f"🎁 账号 [{uid8}] {bo.get('msg')}")
+                                    time.sleep(1.0)
                         time.sleep(1.0)
 
                         # 连登管家闭环（补签保连登 -> 礼包/补偿 -> 连登兑换 -> 自动抽奖）

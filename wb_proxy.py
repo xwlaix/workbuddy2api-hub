@@ -10306,7 +10306,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.9.9",
+        "version": "1.9.10",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -19344,7 +19344,7 @@ class Handler(BaseHTTPRequestHandler):
     # restrictedUntil（wb_accounts.note_restriction_from_error）+ 调度错峰可配
     # （wb_scheduler.SCHEDULER_STAGGER_MIN/_MAX）。两处版本号必须一致，
     # tests/_test_release_engineering.py 钉着这一条。
-    server_version = "wb-proxy/1.9.9"
+    server_version = "wb-proxy/1.9.10"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -24128,6 +24128,14 @@ class Handler(BaseHTTPRequestHandler):
             record_error(model, 502, str(exc), elapsed_ms=int((time.time() - t_start) * 1000),
                          account=account.uid, key=self._key_id())
             return self._error(502, f"upstream stream error: {exc}")
+        finally:
+            # 聚合完立刻放开上游连接：否则账号并发槽要等到 self._json(200, result)
+            # 把响应写完才释放，背靠背的非流式请求会自己和自己撞并发上限。
+            # （取自上游 852b82a 里唯一与 CodeArts 无关的那段）
+            try:
+                upstream.close()
+            except Exception:
+                pass
         if egress_on and egress_key:
             wb_egress.note_success(egress_key)
         wall = int((time.time() - t_start) * 1000)

@@ -483,5 +483,32 @@ class RestrictionPersistenceTests(unittest.TestCase):
         self.assertAlmostEqual(account.restricted_until, first, delta=0.01)
 
 
+
+class OutboundChokepointTests(unittest.TestCase):
+    """wb_tasks 里的出站只允许走 `_open()` 一个口子。
+
+    §C P0-4 把「403 / 11140 就地落盘 restrictedUntil」收进了 `_open()`。此后任何
+    一处直连 `_accounts.urlopen(...)` 都是一条绕过风控记账的暗渠：撞上 403 只当
+    普通失败，账号不进冷却，调度器「跳过受限账号」对这条链路立刻失效。
+    1.9.9 拣上游 937c179（成长任务扩容）时就漏了三处（小程序埋点、盲盒查配额、
+    开盲盒），所以这条守卫按**源码计数**钉住，不依赖某条链路是否被测到。
+    """
+
+    def test_the_direct_urlopen_lives_only_inside_open(self):
+        import wb_tasks
+        path = wb_tasks.__file__
+        if path.endswith((".pyc", ".pyo")):
+            path = path[:-1]
+        text = io.open(path, encoding="utf-8").read()
+        hits = text.count("_accounts.urlopen")
+        self.assertEqual(
+            hits, 1,
+            "wb_tasks 里只允许 _open() 内部直连出站，实际 %d 处（其余请改走 _open）" % hits)
+        start = text.index("def _open(")
+        end = text.index("\nTASK_SPECS", start)
+        self.assertIn("_accounts.urlopen", text[start:end],
+                      "_open() 自己要用 _accounts.urlopen；计数正确但位置不对")
+
+
 if __name__ == "__main__":
     unittest.main()

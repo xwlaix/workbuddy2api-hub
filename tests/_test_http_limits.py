@@ -39,9 +39,14 @@ sys.path.insert(0, ROOT)
 # 导入 wb_proxy 前先把可写目录指到临时区：模块级虽不落盘，但保持一致，避免任何
 # 意外路径写进仓库（与 _test_anthropic_http.py 同一套做法）。
 _WORK = tempfile.mkdtemp(prefix="http-limits-")
-os.environ.setdefault("WB_PROXY_USAGE_DIR", os.path.join(_WORK, "usage"))
-os.environ.setdefault("HOME", _WORK)
-os.environ.setdefault("USERPROFILE", _WORK)
+# 必须**直接赋值**而不是 setdefault：宿主机上这些变量往往已经存在，setdefault
+# 会静默不生效，于是 wb_proxy 导入时读的还是仓库真实 accounts/ —— 面板里存过
+# max_payload_mb=48 的机器上，413 用例就会拿 48MB 去比 16MB 的期望值而假红。
+# ACCOUNTS_DIR 尤其关键：max_payload_mb 这类设置全从它下面的 settings.json 来。
+os.environ["WB_PROXY_USAGE_DIR"] = os.path.join(_WORK, "usage")
+os.environ["ACCOUNTS_DIR"] = os.path.join(_WORK, "accounts")
+os.environ["HOME"] = _WORK
+os.environ["USERPROFILE"] = _WORK
 
 import wb_proxy as P  # noqa: E402  (needs sys.path/env set above)
 

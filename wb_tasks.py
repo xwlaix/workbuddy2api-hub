@@ -117,6 +117,21 @@ def _open(account, req, timeout=15):
         raise urllib.error.HTTPError(exc.url, exc.code, exc.msg, exc.hdrs,
                                      io.BytesIO(body))
 
+def _restricted_now(account):
+    """账号此刻是否正处在受限冷却期。
+
+    §C P0-4 的另一半：`_open()` 负责「403 / 11140 就地落盘 restrictedUntil」，
+    这里负责「落盘之后别再继续打」。单轮成长任务有几十次出站（桌面任务循环 →
+    小程序链式 → 猫猫旅行 → 盲盒 → 拉积分），少了这道短路就会把剩下的请求
+    全送给刚被风控的账号，把一次 403 变成一连串 403。
+    """
+    try:
+        until = float(getattr(account, "restricted_until", 0) or 0)
+    except (TypeError, ValueError):
+        until = 0.0
+    return until > time.time()
+
+
 TASK_SPECS = {
     "create_canvas": {"kind": "canvas", "target": 1, "reward": 300, "name": "创建设计任务"},
     "template_5": {"kind": "template", "target": 5, "reward": 200, "name": "模板创建任务"},
@@ -528,7 +543,7 @@ def report_mp_events(account, events, base=None):
     headers.update(MP_REPORT_HEADERS)
     req = urllib.request.Request(url, data=body, method="POST", headers=headers)
     try:
-        with _accounts.urlopen(req, timeout=15, proxy=account.proxy) as resp:
+        with _open(account, req, timeout=15) as resp:
             d = json.loads(resp.read().decode("utf-8"))
             return d.get("code") == 0
     except Exception as exc:
@@ -892,7 +907,7 @@ def do_buddy_open(account):
     headers = account.headers("chat")
     try:
         req_q = urllib.request.Request(CHAT_BASE + "/v2/activity/growth/buddy/quota", headers=headers)
-        with _accounts.urlopen(req_q, timeout=10, proxy=account.proxy) as resp:
+        with _open(account, req_q, timeout=10) as resp:
             d = json.loads(resp.read().decode("utf-8"))
             quota_data = (d.get("data") or {}) if d.get("code") == 0 else {}
             affordable = int(quota_data.get("affordable") or 0)
@@ -907,7 +922,7 @@ def do_buddy_open(account):
             data=json.dumps(payload).encode("utf-8"),
             method="POST", headers=headers
         )
-        with _accounts.urlopen(req_o, timeout=15, proxy=account.proxy) as resp:
+        with _open(account, req_o, timeout=15) as resp:
             res = json.loads(resp.read().decode("utf-8"))
         if res.get("code") == 0:
             data = res.get("data") or {}
@@ -952,6 +967,9 @@ def run_miniprogram_tasks(account, gap=1.0, claim=True):
     now = int(time.time() * 1000)
 
     for t in mp_tasks:
+        if _restricted_now(account):
+            logs.append("! 账号已进入风控冷却，本轮小程序任务中止")
+            break
         code = t["task_code"]
         if code not in MP_TASK_SPECS and not code.startswith("Sequential_Tasks_"):
             continue
@@ -980,6 +998,9 @@ def run_miniprogram_tasks(account, gap=1.0, claim=True):
         need = max(1, tgt - cur)
         events = []
         for i in range(need):
+            if _restricted_now(account):
+                logs.append("! 账号已进入风控冷却，停止本任务的事件上报")
+                break
             cid = f"wb-mp-{now}-{code}-{i}"
             rid = f"req-{now}-{code}-{i}"
             if code in ("Sequential_Tasks_1", "Sequential_Tasks_3", "Sequential_Tasks_6", "school_season"):
@@ -1060,6 +1081,9 @@ def run_growth_tasks(account, gap=1.0, claim=True):
     #    的前置：必须先把它们点亮并领奖（first_buddy 的奖励就是 Buddy 实例），
     #    否则 single 任务接取会报 "prerequisite not met: first_buddy"。
     for t in tasks:
+        if _restricted_now(account):
+            logs.append("! 账号已进入风控冷却，本轮成长任务中止（前置任务阶段）")
+            break
         if t.get("task_type") == "auto":
             total_earned += _progress_one(account, t, logs, gap, claim=claim)
 
@@ -1101,6 +1125,9 @@ def run_growth_tasks(account, gap=1.0, claim=True):
 
     # 2. 处理每个任务（auto 已在第 0 步处理过）
     for t in tasks:
+        if _restricted_now(account):
+            logs.append("! 账号已进入风控冷却，停止后续任务的进度上报与领奖")
+            break
         if t.get("task_type") == "auto":
             continue
         total_earned += _progress_one(account, t, logs, gap, claim=claim)
@@ -1113,28 +1140,39 @@ def run_growth_tasks(account, gap=1.0, claim=True):
     except Exception as exc:
         logs.append(f"! 小程序成长任务执行异常: {exc}")
 
-    # 3. 顺手检查猫猫旅行与 Buddy 盲盒
-    tr_res = do_cat_travel(account)
+    # 3. 顺手检查猫猫旅行与 Buddy 盲盒（每个子步骤前复查一次受限，别顶风连撞）
+    if _restricted_now(account):
+        logs.append("! 账号已进入风控冷却，跳过猫猫旅行与盲盒")
+        tr_res = {}
+    else:
+        tr_res = do_cat_travel(account)
     if tr_res.get("msg"):
         logs.append(f"猫猫日常: {tr_res.get('msg')}")
         if tr_res.get("credit"):
             total_earned += tr_res.get("credit", 0)
     if tr_res.get("action") == "claim":
         time.sleep(gap)
-        bo_res = do_buddy_open(account)
-        if bo_res.get("action") == "open":
-            logs.append(f"Buddy 盲盒: {bo_res.get('msg')}")
+        if not _restricted_now(account):
+            bo_res = do_buddy_open(account)
+            if bo_res.get("action") == "open":
+                logs.append(f"Buddy 盲盒: {bo_res.get('msg')}")
         time.sleep(gap)
-        tr2 = do_cat_travel(account)
-        if tr2.get("msg") and tr2.get("action") == "depart":
-            logs.append(f"猫猫日常: {tr2.get('msg')}")
+        if not _restricted_now(account):
+            tr2 = do_cat_travel(account)
+            if tr2.get("msg") and tr2.get("action") == "depart":
+                logs.append(f"猫猫日常: {tr2.get('msg')}")
     else:
-        bo_res = do_buddy_open(account)
-        if bo_res.get("action") == "open":
-            logs.append(f"Buddy 盲盒: {bo_res.get('msg')}")
+        # 旅行这一步失败（含刚撞 403 落盘）时不再顺手开盒。
+        if not _restricted_now(account):
+            bo_res = do_buddy_open(account)
+            if bo_res.get("action") == "open":
+                logs.append(f"Buddy 盲盒: {bo_res.get('msg')}")
 
-    # 4. 刷新积分余额
-    account.fetch_credits()
+    # 4. 刷新积分余额（受限时连这一枪也省掉）
+    if _restricted_now(account):
+        logs.append("! 账号已进入风控冷却，跳过积分刷新")
+    else:
+        account.fetch_credits()
     logs.append(f"🎉 全部完成！本次累计新增到账: +{total_earned} 积分，当前总剩余: {account.credits.get('remain', 0)} 积分")
     return {"ok": True, "logs": logs, "earned_credit": total_earned, "credits": account.credits}
 
