@@ -1,3 +1,32 @@
+## v2.0.3
+
+- **可选 Go/uTLS 传输桥**：新增本地 Go/uTLS CONNECT 桥接器，启用后使用 Node/OpenSSL 兼容的 ClientHello（18 个 Cipher、10 个 Extension、无 ALPN），Python 继续负责 HTTP 构造、keep-alive 复用与 SSE 读取。默认仍为 Python/OpenSSL，仅 `WB_TLS_FINGERPRINT=node` 时启用；支持自动发现便携包内的 Windows / macOS / Linux amd64、arm64 桥接器，OpenWrt 额外支持 armv7。桥接器只监听回环地址，使用启动时随机认证密钥，继续验证上游证书，并在 `WB_CA_BUNDLE` 或不受支持的代理路径下拒绝静默降级。
+- **设备 Token 支持**：账号新增独立 `deviceToken`；设置页可配置文件路径 `device_token_file`，面板只显示脱敏来源、长度和加载状态，token 本体不返回浏览器，并支持热重载。优先级为账号 token > `settings.json` 字面值 > 文件；导入/导出仅在显式包含 secrets 时保留设备 token。
+- **桌面 chat 兼容头**：新增默认关闭的桌面 chat 兼容模式，按需发送 SDK 兼容请求头、`X-Agent-Runtime`、`baggage` 与会话字段；环境变量 `WB_DESKTOP_CHAT_COMPAT` 优先于面板设置。
+- **请求体兼容与输出预算**：国内版 Kimi 工具 schema 自动内联 `$ref/$defs`；新增可选最小输出预算与空输出重试，降低推理模型把 token 全用在思考、最终 `finish_reason=length` 但无可见输出的概率。
+- **发布工程**：便携包与 OpenWrt 包接入可选 uTLS 桥；Go 桥由 CI 从源码交叉构建，五个便携目标与三个 OpenWrt 目标均为可选二进制；本仓库不提交本地构建产物。Release 正文改为优先从本文件提取对应版本说明，避免发布页只剩下载块。
+- 全量测试：**285 个套件：216 个 Python + 69 个 JS，`285 passed, 0 failed, 0 skipped`**。
+
+## v2.0.2
+
+- **文本号池 / 媒体号池分区**（#841）：账号新增 `poolScope`（`text` / `media`），文本对话只派文本号，图片 / 视频只派媒体号，空媒体池不回落到文本池。老账号默认 `text`，升级后行为不变；面板可按号池筛选、单号切换或勾选批量挪池，`/accounts/set` 与 `/accounts/set-all` 同步支持 `poolScope`。单实例靠字段过滤，双实例可分别设 `WB_POOL_SCOPE=text|media` 做进程级硬隔离；`WB_POOL_SEPARATION=0` 可回退旧的单池行为。文本任务（签到、成长、猫猫、国际每日活跃）只处理文本号，Token 保活仍覆盖全部账号。
+- **历史思考镜像**：模型名以 `kimi`、`glm`、`minimax`、`mimo`、`step` 或 `space-bunny` 开头时，在工具消息合并完成后，把非空 `reasoning_content` 原样镜像到上游读取的 `reasoning`；不写空白占位，也不注入 DeepSeek 的 `thinking`。
+- **空文本段先补位再出站**（#840）：上游对每个 `type:"text"` 段做长度校验，空 `text` 会返回 `400` / `11151` 并使会话退役。`build_upstream_body()` 现在在发出前把真实 parts 列表与被嗅探字符串数组中的空 text 段填成一个空格；未知 type、非数组 JSON、纯文本与非空 parts 保持不变。
+- **Responses 历史推理保真**（#831）：修复连续 `reasoning` 项目只剩最后一段、相邻两轮助手消息被合并、Chat 形状助手历史里的 `reasoning_content` 被丢弃，以及内置 web 工具第二轮请求丢失第一轮推理的问题；推理只关联所属助手消息，不会写入普通文本，也不改写外部加密内容。
+- **订阅桥接**（#830）：把 Clash / Mihomo 订阅、V2Ray URI 或单个 HTTP / SOCKS 代理转换成 mihomo listener，并同步成网关代理槽；direct 代理会正确生成 `proxies` 条目，HTTP 订阅与 HTTP 代理可区分，缺失 PyYAML 时返回明确错误。
+- **一键启动 WorkBuddy 工作台**（#771）：新增 `start-workbuddy-all.bat`，先通过 `--probe-only` 确认端口上是健康的本项目实例，未运行时再拉起代理，随后打开 WorkBuddy 执行器工作台；端口被陌生服务或卡死实例占用时直接报错。
+- **API Key 出口徽章与模型准入覆盖 CodeArts**（#827）：绑定固定 CodeArts 出口的 Key 正确显示出口徽章；模型准入候选清单补上 `?realm=codearts`，按出口分别缓存；长昵称不再顶出账号卡。
+- **一键测试放行 Clash fake-IP**（#828）：`198.18.0.0/15` 不再被误判为本机断网，环回、RFC1918、链路本地与保留段仍拒绝。
+- 全量测试：**282 个套件：213 个 Python + 69 个 JS，`282 passed, 0 failed, 0 skipped`**。
+
+## v2.0.1
+
+- **国际版 DeepSeek 出站别名**：客户端与 `/v1/models` 继续展示 `deepseek-v4.1-flash`，实际发给国际版上游时使用 `deepseek-v4.1-flash-sg`；显式请求 `-sg` 保持原样，API Key 模型白名单仍按 base 校验，响应与用量记录保留逻辑模型，实际计费模型单独记录。`WB_INTL_MODEL_ALIAS=0` 可关闭映射。
+- **移除废弃的免费额度耗尽回退积分版**：删除设置页开关、后端 6004 自动回退到付费 `-sg` 通道的逻辑与相关测试；免费额度耗尽后不再自动产生积分扣费。
+- **并发名额与账号筛选修复**：上游 400 / 未处理 4xx 透传前归还账号并发名额，避免账号被永久标记为占满；网关重启或重新登录后重置旧账号筛选，避免账号列表被过滤成空。
+- **面板与日志体验修复**：修复手机端账号区按钮和徽章挤压、自绘下拉面板被祖先裁剪、权重列不可读；聊天请求头到达时记录 `chat head`，`responses:` 日志同时记录客户端与实际生效的推理强度。
+- 全量测试：**277 个套件：209 个 Python + 68 个 JS，`277 passed, 0 failed, 0 skipped`**。
+
 ## v2.0.0
 
 **项目停止维护（2026-11-06）**：后续不再更新代码、不跟进上游变化、不再处理新的 issue / PR。感谢大家的 star。
@@ -845,6 +874,8 @@ Windows 便携包补一个可选的前台窗口启动入口：默认仍是静默
 
 ## 未发布
 
+- **一键测试不再把 Clash fake-IP 误判为本机断网**：Clash Verge / sing-box 开启 fake-IP 后，所有域名都解析到 `198.18.0.0/15`，而 Python 的 `ipaddress` 把这段 IANA benchmarking 地址算作 `is_private`；连通性探针在 TCP 握手前就拒绝，面板于是弹「本机网络不通：解析到非公网地址 198.18.0.11」，可真实请求链路并不做这个检查（实测到 fake-IP 的 TCP+TLS 可达，证书正确）。现在 `_is_public_addr()` 单独放行 fake-IP 段，环回 / RFC1918 / 链路本地 / 保留段仍照旧拒绝，并新增回归用例钉住「放行后继续走 TCP 握手」。实测 fake-IP 环境下 cn/intl 探针均 ok，一键测试 5/5 账号通过。 / One-click test no longer mistakes Clash fake-IP for a dead local network: with Clash Verge / sing-box fake-IP enabled every hostname resolves into `198.18.0.0/15`, which Python's `ipaddress` classifies as `is_private` (IANA benchmarking range); the connectivity probe refused it before the TCP handshake, so the panel reported "local network down" even though real requests were fine (TCP+TLS to the fake IP is reachable with a valid certificate). `_is_public_addr()` now allowlists the fake-IP range while loopback / RFC1918 / link-local / reserved addresses stay rejected, with a regression test asserting the address proceeds to the TCP handshake. Verified under fake-IP: both cn/intl probes ok and 5/5 accounts passed the one-click test.
+- **面板密码加密异常明确报错**（#658）：解释器缺少 `hashlib.pbkdf2_hmac` 支持时（如 Windows SAC 拦截便携运行时 DLL），不再将计算异常吞成「密码错误」返回 401，而是明确返回 500 与环境排查指引；启动自检与 `/health`、`/panel/status` 暴露 `crypto_ok` 状态并在面板提示。新增 `tests/_test_panel_crypto_unavailable.py`。
 - **智能体一键配置 (Agent Config)**：参照 EasyCLIProxyAPI 的 agents 机制，支持对本机 Claude Code、Codex CLI、OpenCode、DSH、Crush 客户端的一键检测、配置写入与安全备份还原；内置纯标准库文本级 YAML/TOML/JSON 编辑器与两阶段事务回滚保护。
 - 新增 `tests/_test_agents.py`（26 项 / 97 断言）：覆盖 YAML/TOML/dotenv/JSON 编辑器、客户端注册表、两阶段原子回滚、备份还原与网关 handlers 端到端测试。
 - 新增 `tests/_test_agent_ui.js`（18 项断言）：把看板脚本载入 DOM 桩后直接调用真实的 `applyAgent()` / `restoreAgent()` / `loadAgents()`，断言实际发出的请求体与渲染结果，钉住请求字段名漂移与未声明标识符这两类只在浏览器里暴露的缺陷。

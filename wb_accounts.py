@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from wb_fingerprint import derive_id, generate_request_id, session_id
+import wb_pool_scope
 import wb_activity
 import wb_atrest
 import wb_catalog
@@ -306,11 +307,18 @@ def urlopen(req, timeout=30, proxy=""):
     池路径会原样发这些头名（见 wb_proxy.open_upstream）；没挂的请求（billing /
     登录 / 签到等）走原来的 .title() 路径，行为不变。
     """
+    bridge_required = (wb_upstream_pool.tls_fingerprint_mode() == "node"
+                       and os.environ.get("WB_TLS_BRIDGE", "").strip().lower()
+                       not in ("0", "off", "false", "no", "none")
+                       and str(req.full_url).lower().startswith("https://"))
+    if bridge_required and not wb_upstream_pool.enabled():
+        raise RuntimeError("TLS bridge requires WB_UPSTREAM_KEEPALIVE to be enabled")
     if wb_upstream_pool.enabled():
         try:
             return wb_upstream_pool.urlopen(req, timeout=timeout, proxy=proxy)
         except wb_upstream_pool.PoolBypass:
-            pass
+            if bridge_required:
+                raise RuntimeError("TLS bridge cannot handle this proxy or redirect") from None
     opener = opener_for_proxy(proxy)
     if opener is None:
         return urllib.request.urlopen(req, timeout=timeout)
@@ -554,7 +562,8 @@ REALM_MARKERS = {"cn": CN_REALM_MARKERS, "intl": INTL_REALM_MARKERS}
 #: 不在这套 24h 窗口配额里。键与 Account.realm 的取值一致（intl / cn），
 #: 国内版的 deepseek-v4.1-flash 是收费模型（x0.11），不在名单内。
 FREE_CAP_MODELS = {
-    "intl": frozenset({"hy4-preview-f", "hy3", "deepseek-v4.1-flash"}),
+    "intl": frozenset({"hy4-preview-f", "hy3", "deepseek-v4.1-flash",
+                        "deepseek-v4.1-flash-sg"}),
     "cn": frozenset({"hy4-preview-f", "hy3"}),
 }
 
@@ -706,6 +715,33 @@ def resolve_device_token(accounts_dir):
     with _DEVICE_TOKEN_LOCK:
         _DEVICE_TOKEN_CACHE.update({"key": key, "token": token, "at": now})
     return token
+
+
+def reload_device_token(accounts_dir):
+    """Drop the shared token cache, then resolve the current token immediately."""
+    with _DEVICE_TOKEN_LOCK:
+        _DEVICE_TOKEN_CACHE.update({"key": None, "token": "", "at": 0.0})
+    return resolve_device_token(accounts_dir)
+
+
+def device_token_status(accounts_dir):
+    """Redacted device-token diagnostics; the token itself never leaves memory."""
+    try:
+        cfg = wb_settings.upstream_config(accounts_dir)
+    except Exception:
+        cfg = {}
+    literal = str(cfg.get("device_token") or "").strip()
+    path = str(cfg.get("device_token_file") or "").strip()
+    token = resolve_device_token(accounts_dir)
+    with _DEVICE_TOKEN_LOCK:
+        cached_at = int(_DEVICE_TOKEN_CACHE.get("at") or 0)
+    return {
+        "source": "literal" if literal else ("file" if path else "none"),
+        "configured_file": path,
+        "loaded": bool(token),
+        "length": len(token),
+        "cached_at": cached_at,
+    }
 
 
 def next_local_4am(now=None):
@@ -930,6 +966,9 @@ class Account(object):
         self.enterprise_id = str(data.get("enterpriseId") or "")
         self.access_token = token
         self.refresh_token = str(data.get("refreshToken") or "")
+        self.device_token = str(
+            data.get("deviceToken") or data.get("device_token") or ""
+        ).strip()
         # 静态 Key 永不过期（expiresAt 恒 0）。写 0 而不是「解 JWT 得到的 0」
         # 是有意的：ready() 里 exp 为 0 表示「不按时间淘汰」。
         self.expires_at = (0 if self.is_api_key
@@ -985,6 +1024,14 @@ class Account(object):
         # 只做精确匹配不做前缀：行为可预期，不会误伤同前缀的其他模型。
         raw_deny = data.get("disabledModels")
         self.disabled_models = normalise_disabled_models(raw_deny)
+        # 号池归属：text=只跑文本模型，media=只跑图片/视频。老账号没有这个
+        # 字段时一律留在文本号池——任意 disabledModels 都不能推断成媒体号，
+        # 否则一次模型黑名单就会把正常对话账号悄悄挪走。
+        ps = data.get("poolScope")
+        if ps in ("text", "media"):
+            self.pool_scope = ps
+        else:
+            self.pool_scope = wb_pool_scope.DEFAULT_SCOPE
         # Live error state, never restored from the credential file: the label
         # describes the last upstream answer, not the credential. It used to be
         # persisted and read back, so a 429 that had long since recovered came
@@ -1185,6 +1232,7 @@ class Account(object):
             "note": self.note,
             "group": self.group,
             "disabledModels": list(self.disabled_models),
+            "poolScope": self.pool_scope,
             "lastError": self.last_error,
             "cooldownUntil": self.cooldown_until,
             # 持久化：上游风控限制按小时到工作日计，重启后仍然成立（见
@@ -1268,6 +1316,7 @@ class Account(object):
             "note": self.note,
             "group": self.group,
             "disabledModels": list(self.disabled_models),
+            "poolScope": self.pool_scope,
             "source": self.source,
             "apiKey": bool(self.is_api_key),
             "credentialMask": self.credential_mask(),
@@ -1278,6 +1327,7 @@ class Account(object):
             "tokenExpired": is_token_expired,
             "needRelogin": is_token_expired,
             "hasRefreshToken": bool(self.refresh_token),
+            "hasDeviceToken": bool(self.device_token),
             "lastError": last_error,
             "lastErrorDetail": last_error_detail or None,
             "inCooldown": deadline > now,
@@ -1394,6 +1444,11 @@ class Account(object):
                 # every restart (see RUNTIME_ONLY_FIELDS).
                 for field in RUNTIME_ONLY_FIELDS:
                     payload.pop(field, None)
+                if self.device_token:
+                    payload["deviceToken"] = self.device_token
+                else:
+                    payload.pop("deviceToken", None)
+                    payload.pop("device_token", None)
                 with open(tmp, "w", encoding="utf-8") as fh:
                     json.dump(payload, fh, ensure_ascii=False, indent=2)
                 os.replace(tmp, path)
@@ -1948,6 +2003,8 @@ class Account(object):
         相悖）。见 wb_fingerprint.session_id。
         """
         cfg = get_realm_config(self.realm)
+        accounts_dir = (getattr(self, "accounts_dir", "")
+                        or (os.path.dirname(self.path) if self.path else ""))
 
         if purpose != "chat":
             if purpose == "media":
@@ -1981,7 +2038,8 @@ class Account(object):
                     enterprise_id=self.enterprise_id,
                     tenant_id=self.enterprise_id,
                     private_data=(wb_settings.identity_private_data(
-                        os.path.dirname(self.path)) if self.path else "auto"),
+                        accounts_dir) if accounts_dir else "auto"),
+                    accounts_dir=accounts_dir,
                 ))
                 if self.enterprise_id:
                     headers["X-Enterprise-Id"] = self.enterprise_id
@@ -2046,11 +2104,12 @@ class Account(object):
             turn_request_id=turn_request_id,
             model=model,
             private_data=(wb_settings.identity_private_data(
-                os.path.dirname(self.path)) if self.path else "auto"),
+                accounts_dir) if accounts_dir else "auto"),
+            accounts_dir=accounts_dir,
         )
         if self.is_cli_identity() or (
                 self.product == wb_identity.PRODUCT_DESKTOP
-                and wb_identity.desktop_chat_compat_enabled()):
+                and wb_identity.desktop_chat_compat_enabled(accounts_dir)):
             # Opt-in desktop chat uses the SDK profile, not the billing web profile.
             # 官方 CLI 的 chat 请求由 OpenAI Node SDK 发出：浏览器头一个都没有
             # （X-Requested-With 也没有），Accept 就是 application/json。
@@ -2086,8 +2145,12 @@ class Account(object):
         return headers
 
     def _device_token(self):
-        """Optional X-Device-Token from the configured literal or file."""
-        directory = getattr(self, "accounts_dir", "")
+        """Optional X-Device-Token: account value, then literal, then file."""
+        token = str(getattr(self, "device_token", "") or "").strip()
+        if token:
+            return token
+        directory = (getattr(self, "accounts_dir", "")
+                     or (os.path.dirname(self.path) if self.path else ""))
         if not directory:
             return ""
         return resolve_device_token(directory)
@@ -2791,7 +2854,7 @@ class Account(object):
         """每日活跃对话的实际流程；返回形状见 daily_chat。"""
         import wb_proxy
         url = self.chat_base_url() + wb_proxy.CHAT_PATH
-        model = self.daily_chat_model()
+        model = wb_proxy.intl_model_alias(self.daily_chat_model(), self.realm)
         headers = self.headers("chat", model=model)
         body = {
             "model": model,
@@ -4791,7 +4854,35 @@ class AccountPool(object):
             return [a for a in self.accounts
                     if (not realm or a.realm == realm) and a.task_active()]
 
-    def count_ready(self, realm=None, model=None, allowed=None, refresh=True):
+    def set_pool_scope(self, uid, scope):
+        """Set one account's dispatch pool and persist it."""
+        scope = wb_pool_scope.normalize_scope(scope, default=None)
+        if scope is None:
+            return None
+        account = self.get(uid)
+        if account is None:
+            return None
+        account.pool_scope = scope
+        account.save(self.dir)
+        return account.public()
+
+    def set_pool_scope_many(self, uids, scope):
+        """Move several accounts between pools; returns the uids actually moved."""
+        scope = wb_pool_scope.normalize_scope(scope, default=None)
+        if scope is None:
+            return None
+        moved = []
+        for uid in uids:
+            account = self.get(uid)
+            if account is None:
+                continue
+            account.pool_scope = scope
+            account.save(self.dir)
+            moved.append(uid)
+        return moved
+
+    def count_ready(self, realm=None, model=None, allowed=None, refresh=True,
+                    scope=None):
         """How many accounts can serve right now.
 
         `refresh=False` keeps the count read-only: `Account.ready()` normally
@@ -4801,13 +4892,15 @@ class AccountPool(object):
         """
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+        if scope is not None:
+            snapshot = [a for a in snapshot if wb_pool_scope.in_scope(a, scope)]
         return sum(1 for a in snapshot
                    if a.enabled and a.access_token
                    and a.ready(model=model, refresh=refresh)
                    and (allowed is None or a.uid in allowed))
 
     def pick_for_session(self, realm=None, session_key=None, exclude=None, model=None,
-                         page=None, allowed=None):
+                         page=None, allowed=None, scope=None):
         """Pick the account for one turn of a conversation.
 
         Three shapes, in order of preference:
@@ -4833,7 +4926,9 @@ class AccountPool(object):
         if page is not None:
             with self._lock:
                 pool_size = sum(1 for a in self.accounts
-                                if not realm or a.realm == realm)
+                                if (not realm or a.realm == realm)
+                                and (scope is None
+                                     or wb_pool_scope.in_scope(a, scope)))
             try:
                 whole_pool_page = int(page[1]) >= pool_size
             except (TypeError, ValueError, IndexError):
@@ -4848,17 +4943,19 @@ class AccountPool(object):
                 if allowed is not None and uid not in allowed:
                     continue
                 account = self.get(uid)
+                if scope is not None and not wb_pool_scope.in_scope(account, scope):
+                    account = None
                 if account and account.realm == realm and account.ready(model=model):
                     self.affinity.bind(session_key, uid)
                     return account
         account = self.pick(realm=realm, exclude=exclude, model=model,
                             page=None if whole_pool_page else page,
-                            allowed=allowed)
+                            allowed=allowed, scope=scope)
         if account is None and page is not None:
             # The page has nobody usable right now. Serving the conversation
             # from outside it beats not serving it at all.
             account = self.pick(realm=realm, exclude=exclude, model=model,
-                                allowed=allowed)
+                                allowed=allowed, scope=scope)
         # A page conversation is not bound on purpose: its rotation is what keeps
         # every account of the page warm, and a binding would pin it back to one
         # (the state it was released from). The page cursor carries its rotation.
@@ -4866,10 +4963,13 @@ class AccountPool(object):
             self.affinity.bind(session_key, account.uid)
         return account
 
-    def pick(self, realm=None, exclude=None, model=None, page=None, allowed=None):
+    def pick(self, realm=None, exclude=None, model=None, page=None, allowed=None,
+             scope=None):
         exclude = exclude or set()
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
+        if scope is not None:
+            snapshot = [a for a in snapshot if wb_pool_scope.in_scope(a, scope)]
         if allowed is not None:
             snapshot = [a for a in snapshot if a.uid in allowed]
         if page is not None:
@@ -5150,9 +5250,12 @@ class AccountPool(object):
                 return account
         return None
 
-    def representative(self, realm=None):
+    def representative(self, realm=None, scope=None):
         with self._lock:
             candidates = [a for a in self.accounts if not realm or a.realm == realm]
+            if scope is not None:
+                candidates = [a for a in candidates
+                              if wb_pool_scope.in_scope(a, scope)]
             for account in candidates:
                 if account.access_token: return account
             return candidates[0] if candidates else None
@@ -5581,6 +5684,8 @@ RUNTIME_ONLY_FIELDS = ("lastError", "cooldownUntil")
 def account_to_export(account):
     """Serialise one account for an export document."""
     data = account.to_dict()
+    if account.device_token:
+        data["deviceToken"] = account.device_token
     # Keep the credential and identity; drop nothing, but mark the file source
     # so a re-import on the same machine does not look like a desktop import.
     data.pop("path", None)
@@ -5608,6 +5713,7 @@ def build_export_document(accounts, realm=None, include_secrets=True, uids=None)
         if not include_secrets:
             row.pop("accessToken", None)
             row.pop("refreshToken", None)
+            row.pop("deviceToken", None)
         rows.append(row)
     return {
         "format": EXPORT_FORMAT,
@@ -5738,6 +5844,7 @@ def normalise_import_row(row, realm=None):
         "enterpriseId": str(pick("enterpriseId") or ""),
         "accessToken": token,
         "refreshToken": str(pick("refreshToken") or ""),
+        "deviceToken": str(pick("deviceToken") or pick("device_token") or "").strip(),
         "expiresAt": (0 if api_key
                       else normalize_epoch(pick("expiresAt")) or jwt_exp(token)),
         "source": str(pick("source") or (SOURCE_API_KEY if api_key else "import")),

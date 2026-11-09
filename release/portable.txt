@@ -32,6 +32,7 @@ ops/aliyun/workbuddy2api-hub-updater.conf
 ops/aliyun/workbuddy2api-hub-updater-app.conf
 
 start-wb-proxy.bat
+start-workbuddy-all.bat
 start-wb-proxy-visible.bat
 start-wb-proxy.command
 start-wb-proxy.sh
@@ -48,6 +49,12 @@ allow-firewall.command
 # 随包价格快照：wb_pricing._candidate_file() 优先读它（存在即覆盖内置那份），
 # 少了它便携包只能退回 wb_pricing.py 里内嵌的旧价
 pricing/pricing.json
+tools/wb-tls-bridge/README.md
+tools/wb-tls-bridge/licenses/utls.txt
+tools/wb-tls-bridge/licenses/brotli.txt
+tools/wb-tls-bridge/licenses/compress.txt
+tools/wb-tls-bridge/licenses/x-crypto.txt
+tools/wb-tls-bridge/licenses/x-sys.txt
 
 wb_accounts.py
 wb_activity.py
@@ -64,6 +71,9 @@ wb_logstore.py
 wb_media.py
 wb_media_client.py
 wb_media_tasks.py
+wb_pool_media.py
+wb_pool_scope.py
+wb_pool_text.py
 wb_modelsdev.py
 wb_pricing.py
 wb_probes.py
@@ -85,3 +95,4 @@ wb_webagent.py
 wb_webprompts.py
 wb_webtools.py
 wb_window_probe.py
+wb_subbridge.py

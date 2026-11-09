@@ -18,6 +18,7 @@ import argparse
 import base64
 import bisect
 import calendar
+import copy
 import errno
 import gzip
 import hashlib
@@ -78,6 +79,9 @@ import wb_logstore
 import wb_media
 import wb_media_client
 import wb_media_tasks
+import wb_pool_media
+import wb_pool_scope
+import wb_pool_text
 import wb_pricing
 import wb_usage_io
 import wb_settings
@@ -811,10 +815,13 @@ def media_account_by_uid(uid):
     `import wb_proxy` 会把模块代码再跑一遍，拿到一个 `POOL is None` 的影子模块。
     后果是提交成功却立刻 "账号已不可用"。这里读的是本模块自己的 POOL 全局量。
     """
-    pool = POOL
+    _, pool = _ensure_pools()
     if pool is None:
         return None
     try:
+        # Task recovery may only resume on a media-pool account. Moving the
+        # account back to text makes the task fail clearly instead of silently
+        # using a text credential for image/video work.
         return pool.get(uid)
     except Exception:
         return None
@@ -875,6 +882,14 @@ def _pick_media_account_for(realm, model_id, cost_hint, excluded, config=None):
             "上游账号级限制生效中（整池暂停），%d 秒后再试" % (int(hold) + 1))
     pinned = pinned_account()
     if pinned is not None:
+        _, medias = _ensure_pools()
+        if medias is not None:
+            try:
+                medias.require(pinned)
+            except wb_pool_scope.ScopeViolation as exc:
+                raise wb_media.MediaError("AUTH", str(exc))
+            except wb_pool_text.PoolBoundaryBlocked as exc:
+                raise wb_media.MediaError("NO_ROUTE", str(exc))
         if pinned.realm != realm:
             raise wb_media.MediaError(
                 "INVALID_ARGS", "钉住的账号属于 %s 出口，媒体只走 %s" % (pinned.realm, realm))
@@ -885,7 +900,10 @@ def _pick_media_account_for(realm, model_id, cost_hint, excluded, config=None):
         if not ok:
             raise wb_media.MediaError("NO_CREDIT", "钉住的账号付不起这次调用：%s" % reason)
         return pinned
-    account = POOL.pick(realm=realm, exclude=excluded or set(), model=model_id)
+    _, medias = _ensure_pools()
+    account = (medias.pick(realm=realm, exclude=excluded or set(),
+                           model=model_id)
+               if medias is not None else None)
     if account is None:
         return None
     ok, reason = media_budget_ok(account, cost_hint)
@@ -976,6 +994,14 @@ def read_catalog_dump(realm):
         return None
 MODELS_PATH = "/v2/enterprises/personal/models"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
+# Routes whose request head is traced on arrival (see do_POST): the ones a
+# conversation actually uses, so the trace stays quiet on panel polling.
+_CHAT_PATHS = (
+    "/v1/chat/completions", "/chat/completions",
+    "/v1/completions", "/completions",
+    "/v1/responses", "/responses",
+    "/v1/messages", "/messages",
+)
 
 # ---------------------------------------------------------------------------
 # Background-model redirection (desktop clients).
@@ -1003,7 +1029,57 @@ BACKGROUND_MODEL_NAMES = tuple(
 )
 
 
+INTL_MODEL_ALIASES = {
+    "deepseek-v4.1-flash": "deepseek-v4.1-flash-sg",
+}
+
+
+def intl_model_alias_enabled():
+    """The intl id remap is on unless WB_INTL_MODEL_ALIAS disables it."""
+    raw = os.environ.get("WB_INTL_MODEL_ALIAS", "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def intl_model_alias(name, realm=None):
+    """The intl upstream id for `name`, or `name` unchanged.
+
+    The intl exit renamed deepseek-v4.1-flash to the "-sg" build in 2026-11:
+    the desktop client's own catalogue (and the product config fetched from
+    www.workbuddy.ai) lists only deepseek-v4.1-flash-sg, while a request for
+    the old base id answers code 6004 "usage exceeds frequency limit" on
+    accounts whose base bucket is empty.
+
+    This is an outbound alias only. Clients and /v1/models keep the logical
+    id, and API-key model checks run before the alias is applied.
+    """
+    text = str(name or "")
+    if (realm or CURRENT_REALM) != "intl" or not intl_model_alias_enabled():
+        return text
+    return INTL_MODEL_ALIASES.get(text.strip().lower(), text)
+
+
+def apply_intl_model_alias(payload, realm=None):
+    """Rewrite one request body to the intl upstream id; returns the new id.
+
+    Kept for callers that are constructing an outbound body themselves (the
+    panel probe and the window probe). The request handlers must not call it:
+    rewriting the client payload at ingress would make /v1/models and API-key
+    permissions see the upstream id instead of the logical one.
+    """
+    if not isinstance(payload, dict):
+        return ""
+    name = str(payload.get("model") or "")
+    target = intl_model_alias(name, realm)
+    if target == name:
+        return name
+    payload["model"] = target
+    log("alias: intl model %s -> %s" % (name, target))
+    return target
+
+
 def _apply_deepseek_flash_target(payload, realm=None):
+    # Historical hook kept as a no-op: the intl alias is applied when the
+    # upstream body is built, after all client-facing model checks.
     return
 
 
@@ -3713,7 +3789,8 @@ def _remaining_payload(now=None, accounts=None):
     """
     now = time.time() if now is None else now
     if accounts is None:
-        accounts = list(POOL.accounts) if POOL else []
+        texts, _ = _ensure_pools()
+        accounts = texts.accounts() if texts else []
     accounts = [a for a in accounts
                 if getattr(a, "enabled", True) and getattr(a, "uid", "")]
     with _remaining_state_lock:
@@ -6701,6 +6778,49 @@ def recent_usage(limit=100, realm=None, page=1):
         "rows": page_rows
     }
 POOL = None
+# Dispatch views over the one shared AccountPool. The pool owns credentials,
+# refresh, proxies and guards; these two views only enforce which kind of
+# traffic each account may serve.
+TEXTS = None
+MEDIAS = None
+
+
+def _pool_views_ready():
+    """Whether both dispatch views are bound to the current POOL."""
+    return (TEXTS is not None and MEDIAS is not None
+            and getattr(TEXTS, "pool", None) is POOL
+            and getattr(MEDIAS, "pool", None) is POOL)
+
+
+def _ensure_pools():
+    """Return the dispatch views, rebinding them if POOL was replaced.
+
+    Production binds once after loading. Tests and embedders assign the
+    module-level POOL directly; without this check they would keep using a
+    stale pool from an earlier test.
+    """
+    if POOL is None:
+        return None, None
+    if not _pool_views_ready():
+        return _bind_pools()
+    return TEXTS, MEDIAS
+
+
+def _bind_pools():
+    """Bind text/media dispatch views to the loaded account pool."""
+    global TEXTS, MEDIAS
+    if POOL is None:
+        TEXTS = None
+        MEDIAS = None
+    else:
+        TEXTS = wb_pool_text.TextPool(POOL, log=log)
+        MEDIAS = wb_pool_media.MediaPool(POOL, log=log)
+    return TEXTS, MEDIAS
+
+
+def _pool_representative(realm=None, scope=None):
+    """``representative_account`` for code that already owns a pool view."""
+    return representative_account(realm=realm, scope=scope)
 
 # Pinned-account routes (/u/<ref>/v1/...): the handler strips the prefix and
 # resolves the ref before dispatching. One thread serves one connection at a
@@ -6911,7 +7031,11 @@ def account_views(realm=None):
     """List view of every account, including a live readiness flag."""
     if not POOL:
         return []
-    return POOL.list_public(realm=realm)
+    rows = POOL.list_public(realm=realm)
+    for row in rows:
+        row["poolScope"] = wb_pool_scope.normalize_scope(
+            row.get("poolScope"))
+    return rows
 
 
 def _finite_number(value):
@@ -7275,6 +7399,115 @@ def proxy_slots_view():
         item["label"] = slot_label(entry)
         out.append(item)
     return out
+
+
+SUBBRIDGE_HOST = os.environ.get("WB_SUBBRIDGE_HOST") or os.environ.get(
+    "WB_SUBBRIDGE_LISTEN") or "172.17.0.1"
+_SUBBRIDGE_SLOT_PORT_RE = re.compile(
+    r"^http://(?:%s|127\.0\.0\.1):(\d+)(?:/)?$"
+    % re.escape(SUBBRIDGE_HOST))
+SUBBRIDGE_PORT_START = int(os.environ.get("WB_SUBBRIDGE_PORT_START") or "17901")
+SUBBRIDGE_PORT_COUNT = int(os.environ.get("WB_SUBBRIDGE_PORT_COUNT") or "64")
+SUBBRIDGE_PORT_RANGE = range(SUBBRIDGE_PORT_START,
+                             SUBBRIDGE_PORT_START + SUBBRIDGE_PORT_COUNT)
+
+
+def _is_subbridge_slot(entry):
+    """Whether a slot is managed by the subscription bridge port pool."""
+    match = _SUBBRIDGE_SLOT_PORT_RE.match(str((entry or {}).get("url") or ""))
+    if not match:
+        return False
+    try:
+        return int(match.group(1)) in SUBBRIDGE_PORT_RANGE
+    except ValueError:
+        return False
+
+
+def reconcile_subbridge_slots(current, probes, probed_at=None):
+    """Replace bridge-managed slots while preserving manual slots and slot ids."""
+    now = int(probed_at if probed_at is not None else time.time())
+    existing = {}
+    manual = []
+    for raw in current or []:
+        if not isinstance(raw, dict):
+            continue
+        entry = dict(raw)
+        if _is_subbridge_slot(entry):
+            url = str(entry.get("url") or "")
+            if url:
+                existing[url] = entry
+        else:
+            manual.append(entry)
+
+    managed = []
+    seen = set()
+    for probe in probes or []:
+        if not isinstance(probe, dict):
+            continue
+        url = str(probe.get("url") or "").strip()
+        if not url or url in seen or not _is_subbridge_slot({"url": url}):
+            continue
+        seen.add(url)
+        entry = dict(existing.get(url) or {"id": "", "url": url})
+        name = str(probe.get("name") or "").strip()
+        if name:
+            entry["name"] = name
+        entry["enabled"] = bool(probe.get("ok"))
+        entry["ip"] = str(probe.get("exit_ip") or "").strip()
+        entry["probed_at"] = now
+        for field in ("country", "country_code", "ip_type", "isp", "asn"):
+            value = str(probe.get(field) or "").strip()
+            if value:
+                entry[field] = value
+        managed.append(wb_settings._clean_slot_entry(entry) or entry)
+    return manual + managed
+
+
+def probe_subbridge_listeners(listeners, rounds=3, workers=8):
+    """Probe newly rendered listener ports concurrently, retaining failures."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    targets = []
+    for item in listeners or []:
+        try:
+            port = int(item.get("port"))
+        except (TypeError, ValueError):
+            continue
+        targets.append({
+            "port": port,
+            "url": "http://%s:%d" % (SUBBRIDGE_HOST, port),
+            "name": str(item.get("proxy") or item.get("name") or "").strip(),
+            "ok": False,
+            "exit_ip": "",
+            "error": "not probed",
+        })
+
+    def probe(target):
+        exit_ip, error = probe_proxy_exit(target["url"], timeout=7)
+        return {
+            "port": target["port"],
+            "url": target["url"],
+            "name": target["name"],
+            "ok": bool(exit_ip),
+            "exit_ip": exit_ip,
+            "error": error,
+        }
+
+    for attempt in range(max(1, int(rounds))):
+        pending = [index for index, target in enumerate(targets)
+                   if not target.get("ok")]
+        if not pending:
+            break
+        with ThreadPoolExecutor(max_workers=min(max(1, int(workers)),
+                                                len(pending))) as pool:
+            results = list(pool.map(lambda index: (index, probe(targets[index])),
+                                    pending))
+        for index, result in results:
+            targets[index] = result
+        if attempt + 1 < max(1, int(rounds)) and any(
+                not target.get("ok") for target in targets):
+            time.sleep(3)
+    return targets
 
 
 _byacct_cache = {"at": 0.0, "data": None}
@@ -11249,8 +11482,31 @@ def _usage_cache_maybe_save(kind, offset):
     return wrote
 
 
+def _panel_upstream_config(accounts_dir):
+    """Upstream settings safe for the panel; the token value never leaves here."""
+    config = wb_settings.upstream_config(accounts_dir)
+    config.pop("device_token", None)
+    return config
+
+
+def _panel_device_token_status(accounts_dir):
+    """Redacted device-token status; a broken file must not break settings."""
+    try:
+        return wb_accounts.device_token_status(accounts_dir)
+    except Exception as exc:
+        log("could not read device token status: %s" % type(exc).__name__,
+            level="WARN", tag="settings")
+        return {
+            "source": "none",
+            "configured_file": "",
+            "loaded": False,
+            "length": 0,
+            "cached_at": 0,
+        }
+
+
 def runtime_settings_view():
-    """Current panel-visible settings (never returns the password or the key)."""
+    """Current panel-visible settings (never returns passwords or secrets)."""
     key = API_KEY or ""
     if len(key) > 8:
         masked = key[:4] + "*" * 6 + key[-4:]
@@ -11310,7 +11566,6 @@ def runtime_settings_view():
         "pricing_enabled": wb_settings.pricing_enabled(ACCOUNTS_DIR),
         "auto_switch_product": wb_settings.auto_switch_product(ACCOUNTS_DIR),
         "auto_switch_products": wb_settings.auto_switch_products(ACCOUNTS_DIR),
-        "free_model_credit_fallback": wb_settings.free_model_credit_fallback(ACCOUNTS_DIR),
         "enable_anthropic_messages": wb_settings.enable_anthropic_messages(ACCOUNTS_DIR),
         "filter_models_by_key": wb_settings.filter_models_by_key(ACCOUNTS_DIR),
         "reasoning_effort_map": wb_settings.reasoning_effort_map(ACCOUNTS_DIR),
@@ -11393,7 +11648,9 @@ def runtime_settings_view():
         ],
         "keep_backups": wb_settings.keep_backups(ACCOUNTS_DIR),
         "keep_backups_max": wb_settings.MAX_KEEP_BACKUPS,
-        "upstream": wb_settings.upstream_config(ACCOUNTS_DIR),
+        "upstream": _panel_upstream_config(ACCOUNTS_DIR),
+        "device_token_status": _panel_device_token_status(ACCOUNTS_DIR),
+        "desktop_chat_compat": wb_settings.desktop_chat_compat(ACCOUNTS_DIR),
         "max_payload_mb": wb_settings.max_payload_mb(ACCOUNTS_DIR),
         "max_payload_bytes_effective": (wb_settings.max_payload_mb(ACCOUNTS_DIR) * 1024 * 1024
                                         if wb_settings.max_payload_mb(ACCOUNTS_DIR) is not None
@@ -11407,11 +11664,30 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "2.0.0",
+        "version": "2.0.3",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
-    return POOL.representative() if POOL else None
+    return representative_account(scope=wb_pool_scope.SCOPE_TEXT)
+
+
+def representative_account(realm=None, scope=None):
+    """Pool representative with a legacy-pool compatibility fallback.
+
+    AccountPool accepts ``scope``; test and embedding pools written before
+    pool separation only accept ``realm``. Catalog refresh, health summaries
+    and media catalog reads all need the same seam, so the fallback lives
+    here instead of being repeated at every call site.
+    """
+    if POOL is None:
+        return None
+    if scope is not None:
+        try:
+            return POOL.representative(realm=realm, scope=scope)
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+    return POOL.representative(realm=realm)
 
 def quota_scan_interval_hours():
     """The polling period the quota scanner runs on, for the panel caption."""
@@ -11675,7 +11951,7 @@ _LOG_WARN_HINTS = (
 # 想按模块看某一类问题时筛不出来。原有类别（chat/scheduler/tasks/accounts/
 # catalog/auth/settings）的相对顺序保持不变，避免改变既有日志的归类。
 _LOG_TAG_HINTS = (
-    ("chat", ("chat:", "chat done", "request error", "/v1/chat",
+    ("chat", ("chat:", "chat head:", "chat done", "request error", "/v1/chat",
               "/chat/completions", "responses")),
     ("scheduler", ("scheduler", "调度器")),
     ("tasks", ("task", "任务", "打卡", "签到", "猫猫", "travel", "growth")),
@@ -12152,7 +12428,8 @@ def models_available_for(model, realm):
     """
     if POOL is None:
         return True
-    usable = [a for a in POOL.accounts
+    texts, _ = _ensure_pools()
+    usable = [a for a in (texts.accounts() if texts else POOL.accounts)
               if a.realm == realm and a.enabled and a.access_token]
     if not usable:
         return False
@@ -12560,7 +12837,8 @@ def fetch_remote_product_config(realm):
     """
     if realm not in ("intl", "cn") or POOL is None:
         return None
-    account = POOL.representative(realm=realm)
+    account = representative_account(
+        realm=realm, scope=wb_pool_scope.SCOPE_TEXT)
     if account is None or not account.access_token:
         log("remote catalog: no usable %s account, skipping" % realm)
         return None
@@ -12694,7 +12972,8 @@ def catalog_daily_pass(now=None):
     """
     done = []
     for realm in catalog_daily_due(now):
-        if POOL is None or POOL.representative(realm=realm) is None:
+        if POOL is None or representative_account(
+                realm=realm, scope=wb_pool_scope.SCOPE_TEXT) is None:
             continue
         out = refresh_catalog(realm)
         log("catalog daily: %s -> %s" % (realm, out.get("msg")))
@@ -12805,7 +13084,8 @@ def curated_live_sources(realm):
 
 
 def fetch_endpoint_models():
-    account = POOL.pick(realm="intl") if POOL else None
+    texts, _ = _ensure_pools()
+    account = texts.pick(realm="intl") if texts else None
     if account is None:
         log("model discovery skipped: no usable account")
         cached = _models_cache.get("intl", {}).get("data")
@@ -13170,6 +13450,27 @@ def preserve_request_contract_enabled():
         "1", "true", "yes", "on")
 
 
+def sanitize_tools(tools):
+    """Remove channel fingerprints from function descriptions."""
+    if not isinstance(tools, list):
+        return tools
+    out = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            out.append(tool)
+            continue
+        item = dict(tool)
+        fn = item.get("function")
+        if isinstance(fn, dict):
+            fn = dict(fn)
+            desc = fn.get("description")
+            if isinstance(desc, str):
+                fn["description"] = sanitize_text(desc, identity=True)
+            item["function"] = fn
+        out.append(item)
+    return out
+
+
 def sanitize_tool_calls(tool_calls):
     if not isinstance(tool_calls, list):
         return tool_calls
@@ -13221,6 +13522,9 @@ def sanitize_messages(messages):
             if isinstance(item.get("reasoning_content"), str):
                 item["reasoning_content"] = sanitize_text(
                     item["reasoning_content"], identity=False)
+            if not preserve_request_contract_enabled() and isinstance(item.get("reasoning"), str):
+                item["reasoning"] = sanitize_text(
+                    item["reasoning"], identity=False)
             if "tool_calls" in item:
                 item["tool_calls"] = sanitize_tool_calls(item["tool_calls"])
             out.append(item)
@@ -13540,6 +13844,95 @@ def backfill_reasoning_content(messages, model, thinking_enabled=None):
         else:
             out.append(m)
     return out
+
+
+def mirror_upstream_reasoning(messages, model):
+    """Mirror reasoning_content for models whose upstream reads reasoning."""
+    model_prefixes = (
+        "kimi", "glm", "minimax", "mimo", "step", "space-bunny",
+    )
+    model_name = str(model or "").lower()
+    if not any(model_name == prefix or model_name.startswith(prefix + "-")
+               for prefix in model_prefixes):
+        return messages
+    if not isinstance(messages, list):
+        return messages
+    out = []
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            out.append(message)
+            continue
+        item = dict(message)
+        reasoning_content = item.get("reasoning_content")
+        reasoning = item.get("reasoning")
+        if (isinstance(reasoning_content, str) and reasoning_content.strip()
+                and not (isinstance(reasoning, str) and reasoning.strip())):
+            item["reasoning"] = reasoning_content
+        out.append(item)
+    return out
+# ---------------------------------------------------------------------------
+# Empty text parts (code 11151)
+# ---------------------------------------------------------------------------
+# 上游对每个 text 段做长度校验：`text` 为 "" 或缺失直接 400 / 11151
+# 「a message has empty content」，整段会话就此退役——每次重试都重放同一历史，
+# 换账号也救不回来。触发点不只是客户端真的发了 parts 数组：上游会把**字符串**
+# content 里以 `[` 开头的 JSON 数组当作 parts 解析，于是工具结果里常见的表单 /
+# 按钮抓取（`[{"type":"text","text":""}, ...]`）被当成一个空文本段。
+# 实测（kimi-k3.1-pro，cn 号池）：
+#   [{"type":"text","text":""}]            -> 400 / 11151
+#   [{"type":"text","text":null}]           -> 400 / 11151
+#   [{"type":"text"}]                       -> 400 / 11151
+#   [{"type":"text","text":"   "}]          -> 200（只看长度是否为零）
+#   [{"type":"textarea","text":""}]         -> 200（未识别的 type 被忽略）
+#   {"type":"text","text":""}（非数组）      -> 200（不嗅探对象）
+# 所以只补值、不删段：空 text 段填一个空格，语义不变（模型本来也看不到内容）。
+# 注意前缀空格挡不住嗅探——上游会先跳过空白再解析，别用那种写法。
+EMPTY_TEXT_PART_FILL = " "
+def _fill_empty_text_parts(parts):
+    """Give every empty text part a placeholder; True when one was filled."""
+    changed = False
+    for part in parts:
+        if not isinstance(part, dict) or part.get("type") != "text":
+            continue
+        text = part.get("text")
+        if text is None or text == "":
+            part["text"] = EMPTY_TEXT_PART_FILL
+            changed = True
+    return changed
+def _sniffed_parts(content):
+    """Return the parsed parts when a string body would be read as part list."""
+    if not isinstance(content, str):
+        return None
+    stripped = content.lstrip()
+    if not stripped.startswith("["):
+        return None
+    try:
+        parts = json.loads(stripped)
+    except Exception:
+        return None
+    if not parts or not isinstance(parts, list):
+        return None
+    if not all(isinstance(part, dict) for part in parts):
+        return None
+    return parts
+def guard_empty_text_parts(messages):
+    """Fill empty text parts, in real part lists and in sniffer-parsed strings."""
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            # 只复制要改的 text 段；图片等其余段保持原引用，不改写调用方载荷。
+            parts = [dict(part) if isinstance(part, dict)
+                     and part.get("type") == "text" else part
+                     for part in content]
+            if _fill_empty_text_parts(parts):
+                m["content"] = parts
+        else:
+            parts = _sniffed_parts(content)
+            if parts is not None and _fill_empty_text_parts(parts):
+                m["content"] = json.dumps(parts, ensure_ascii=False)
+    return messages
 # ---------------------------------------------------------------------------
 # Tool & Tool Choice Normalization (avoids code 11101 on object tool_choice)
 # ---------------------------------------------------------------------------
@@ -13707,7 +14100,7 @@ def _normalize_tool_parameters(fn):
     if params is None or not isinstance(params, dict):
         fn["parameters"] = {"type": "object", "properties": {}}
         return
-    p = dict(params)
+    p = copy.deepcopy(params)
     if p.get("type") != "object":
         p["type"] = "object"
     if "properties" not in p or not isinstance(p.get("properties"), dict):
@@ -13788,6 +14181,137 @@ def normalize_tools(obj):
             obj.pop("tools", None)
     else:
         obj.pop("tools", None)
+    if obj.get("tools") and not preserve_request_contract_enabled():
+        obj["tools"] = sanitize_tools(obj["tools"])
+
+
+def _schema_contains_ref(node):
+    if isinstance(node, dict):
+        if "$ref" in node:
+            return True
+        return any(_schema_contains_ref(value) for key, value in node.items()
+                   if key not in ("default", "examples", "example", "enum", "const"))
+    if isinstance(node, list):
+        return any(_schema_contains_ref(value) for value in node)
+    return False
+
+
+def _inline_kimi_schema_node(node, defs, seen=None, depth=0, budget=None):
+    """Inline local JSON Schema references for Kimi tool declarations."""
+    if budget is None:
+        budget = [10000]
+    if depth > 64:
+        return {}
+    if budget[0] <= 0:
+        budget[0] = -1
+        return {}
+    budget[0] -= 1
+
+    if isinstance(node, list):
+        out = []
+        for value in node:
+            expanded = _inline_kimi_schema_node(
+                value, defs, seen=seen, depth=depth + 1, budget=budget)
+            if budget[0] < 0:
+                return {}
+            out.append(expanded)
+        return out
+    if not isinstance(node, dict):
+        return node
+
+    ref = node.get("$ref")
+    if isinstance(ref, str):
+        name = None
+        for prefix in ("#/$defs/", "#/definitions/"):
+            if ref.startswith(prefix):
+                name = ref[len(prefix):].replace("~1", "/").replace("~0", "~")
+                break
+        if name is None:
+            return dict(node)
+        active = set(seen or ())
+        if not name or name not in defs:
+            return {"type": "object"}
+        if name in active:
+            return {}
+        active.add(name)
+        expanded = _inline_kimi_schema_node(
+            defs[name], defs, seen=active, depth=depth + 1, budget=budget)
+        if budget[0] < 0:
+            return {}
+        siblings = {}
+        root = depth == 0
+        for key, value in node.items():
+            if key == "$ref" or (
+                    root and key in ("$defs", "definitions", "$schema")):
+                continue
+            child = _inline_kimi_schema_node(
+                value, defs, seen=active, depth=depth + 1, budget=budget)
+            if budget[0] < 0:
+                return {}
+            siblings[key] = child
+        if siblings and isinstance(expanded, dict):
+            expanded = dict(expanded)
+            expanded.update(siblings)
+        return expanded
+
+    out = {}
+    root = depth == 0
+    for key, value in node.items():
+        if root and key in ("$defs", "definitions", "$schema"):
+            continue
+        if key in ("default", "examples", "example", "enum", "const"):
+            out[key] = value
+            continue
+        child = _inline_kimi_schema_node(
+            value, defs, seen=seen, depth=depth + 1, budget=budget)
+        if budget[0] < 0:
+            return {}
+        out[key] = child
+    return out
+
+
+def inline_kimi_tool_schemas(body):
+    """Inline $ref/$defs in Kimi tool schemas before the request leaves."""
+    if not isinstance(body, dict):
+        return body
+    model = str(body.get("model") or "").strip().lower()
+    if model.startswith("cn:"):
+        model = model[3:].strip()
+    if not model.startswith("kimi") or not isinstance(body.get("tools"), list):
+        return body
+
+    for tool in body["tools"]:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function")
+        if not isinstance(fn, dict):
+            continue
+        params = fn.get("parameters")
+        if not isinstance(params, dict):
+            continue
+        if not ("$defs" in params or "definitions" in params
+                or _schema_contains_ref(params)):
+            continue
+
+        defs = {}
+        for key in ("definitions", "$defs"):
+            values = params.get(key)
+            if isinstance(values, dict):
+                defs.update(values)
+        budget = [10000]
+        expanded = _inline_kimi_schema_node(
+            params, defs, seen=set(), depth=0, budget=budget)
+        if budget[0] < 0:
+            continue
+        if not isinstance(expanded, dict):
+            expanded = {"type": "object"}
+        fn = dict(fn)
+        fn["parameters"] = expanded
+        _normalize_tool_parameters(fn)
+        tool["function"] = fn
+    return body
+
+
 # ---------------------------------------------------------------------------
 # Stop Sequence Normalization (avoids code 11101 on a string stop)
 # ---------------------------------------------------------------------------
@@ -14535,6 +15059,94 @@ def apply_prompt_mode(messages):
     return messages
 
 
+MIN_BUDGET_BY_EFFORT = {
+    "minimal": 4096,
+    "low": 4096,
+    "medium": 6144,
+    "high": 8192,
+    "xhigh": 12288,
+    "max": 16384,
+}
+MIN_OUTPUT_BUDGET_PROBE = 16
+
+
+def min_output_budget_enabled():
+    return os.environ.get("WB_MIN_OUTPUT_BUDGET", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def ensure_min_output_budget(body, model=None):
+    """Raise explicit output budgets to the floor for the active effort."""
+    if not isinstance(body, dict) or "max_tokens" not in body:
+        return body
+    try:
+        current = int(body.get("max_tokens"))
+    except (TypeError, ValueError):
+        return body
+    if current < MIN_OUTPUT_BUDGET_PROBE:
+        return body
+
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and \
+            str(thinking.get("type") or "").strip().lower() == "disabled":
+        return body
+    effort = str(body.get("reasoning_effort")
+                 or body.get("reasoningEffort") or "").strip().lower()
+    if effort == "none":
+        return body
+    floor = MIN_BUDGET_BY_EFFORT.get(effort)
+    if floor is None:
+        return body
+    cap = model_default_max_output_tokens(model) if model else None
+    if cap and cap < floor:
+        floor = cap
+    if current < floor:
+        body["max_tokens"] = floor
+    return body
+
+
+def is_starved_completion(content_text, tool_calls, finish_reason):
+    """A length stop with no visible output and no tool call needs a retry."""
+    return (str(finish_reason or "").strip().lower() == "length"
+            and not str(content_text or "").strip()
+            and not tool_calls)
+
+
+def build_starved_retry_body(body, floor=0):
+    """Build the no-thinking retry body for a starved completion."""
+    if not isinstance(body, dict):
+        return None, False
+    current = None
+    if "max_tokens" in body:
+        try:
+            current = int(body.get("max_tokens"))
+        except (TypeError, ValueError):
+            current = None
+        if current is not None and current < MIN_OUTPUT_BUDGET_PROBE:
+            return None, False
+
+    thinking = body.get("thinking")
+    effort = str(body.get("reasoning_effort")
+                 or body.get("reasoningEffort") or "").strip().lower()
+    if (isinstance(thinking, dict)
+            and str(thinking.get("type") or "").strip().lower() == "disabled") \
+            or effort in ("none", "off", "disabled", "disable"):
+        return None, False
+
+    out = dict(body)
+    out["thinking"] = {"type": "disabled"}
+    out.pop("reasoning_effort", None)
+    out.pop("reasoningEffort", None)
+    try:
+        floor = int(floor or 0)
+    except (TypeError, ValueError):
+        floor = 0
+    if floor > 0 and current is not None \
+            and current >= MIN_OUTPUT_BUDGET_PROBE and current < floor:
+        out["max_tokens"] = floor
+    return out, True
+
+
 def build_upstream_body(payload):
     model = payload.get("model") or ""
     # Map an unsupported level before anything below reads the effort, so the
@@ -14582,7 +15194,11 @@ def build_upstream_body(payload):
     repaired, _merged = merge_adjacent_tool_calls(body["messages"])
     repaired, _repacked = repack_tool_result_blocks(repaired)
     repaired, _cleaned = cleanup_orphan_tool_calls(repaired)
-    body["messages"] = repaired
+    # Last shape check: an empty text part is a hard 400 (11151) whichever side
+    # produced it, and it has to run after the merges above because they can
+    # move a string content into a different message.
+    body["messages"] = guard_empty_text_parts(repaired)
+    body["messages"] = mirror_upstream_reasoning(body["messages"], model)
     translate_max_completion_tokens(body)
     # Upstream GPT-family models enforce a minimum max_output_tokens >= 16;
     # smaller values (e.g. max_tokens=1 from probes) fail with 400 integer_below_min_value (#364, #252).
@@ -14628,6 +15244,8 @@ def build_upstream_body(payload):
                         body["reasoning_effort"] = chosen
     # 显式档位模型（glm-5.1）：不带档位上游直接 400 / 11150，补上目录档位。
     ensure_explicit_effort(body, model)
+    if min_output_budget_enabled():
+        ensure_min_output_budget(body, model)
     body["stream"] = True
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
@@ -15212,7 +15830,9 @@ def retry_after_seconds(model, realm):
     """Shortest wait until any account of this realm can serve `model` again."""
     if not POOL:
         return 60
-    waits = [a.throttle_wait(model=model) for a in POOL.accounts
+    texts, _ = _ensure_pools()
+    accounts = texts.accounts() if texts else list(POOL.accounts)
+    waits = [a.throttle_wait(model=model) for a in accounts
              if a.realm == realm and a.enabled and a.access_token]
     active = [w for w in waits if w > 0]
     return int(min(active)) if active else 60
@@ -16256,20 +16876,8 @@ def schedule_window_probe(account, model, reset_at, cap=False, cap_at=0.0):
         return False
 
 
-_FREE_MODEL_CREDIT_FALLBACKS = {
-    ("intl", "deepseek-v4.1-flash"): "deepseek-v4.1-flash-sg",
-}
-
-
-def _free_model_credit_fallback_enabled():
-    if wb_settings.free_model_credit_fallback(ACCOUNTS_DIR):
-        return True
-    return os.environ.get("WB_ENABLE_FREE_MODEL_CREDIT_FALLBACK", "0").strip().lower() in (
-        "1", "true", "yes", "on")
-
-
 def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=None,
-                  allow_credit_fallback=True, allow_product_switch=True,
+                  allow_product_switch=True,
                   pin_account=None, defer_egress_success=False,
                   allowed_accounts=None):
     # Refresh the daily guards before picking. The scan underneath is
@@ -16288,9 +16896,18 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         POOL.apply_remaining_weights(
             remaining_schedule_weights() if remaining_priority_enabled() else None)
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
-    model = str(payload.get("model") or "")
+    requested_model = str(payload.get("model") or "")
+    model = intl_model_alias(requested_model, realm)
+    texts, _ = _ensure_pools()
     pinned = pin_account if pin_account is not None else pinned_account()
     if pinned is not None:
+        if texts is not None:
+            try:
+                texts.require(pinned)
+            except wb_pool_scope.ScopeViolation as exc:
+                raise PinnedAccountError(403, str(exc), pinned.uid)
+            except wb_pool_text.PoolBoundaryBlocked as exc:
+                raise PinnedAccountError(503, str(exc), pinned.uid)
         if allowed_accounts is not None and pinned.uid not in allowed_accounts:
             raise PinnedAccountError(
                 403, "pinned account '%s' is not allowed by this API key"
@@ -16317,6 +16934,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # payload 重建（degrade 会切换 prompt 模式，必须拿到新 body）。
     upstream_body = (prebuilt_body if prebuilt_body is not None
                      else build_upstream_body(payload))
+    if upstream_body.get("model") != model:
+        # prebuilt_body is built from the client payload before open_upstream
+        # is called. Copy before changing it so callers can safely reuse their
+        # object across retries, and so the client-visible model never changes.
+        upstream_body = dict(upstream_body)
+        upstream_body["model"] = model
     # PATCHED-BY-OPS: 客户端未提供会话标识时，用对话稳定前缀兜底。
     # 位置放在 build_upstream_body 之后，保证键与真正发往上游的消息一致
     # （该函数可能在最前面插入 SYSTEM_PROMPT）。affinity_page 只在超限对话上
@@ -16335,13 +16958,13 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # Only pass `allowed` when the request actually carries a restriction: a
     # stub pool in tests (and any external pool implementation) keeps its old
     # count_ready signature for the unrestricted path.
-    if POOL is None:
+    if texts is None:
         ready_total = 1
     elif allowed_accounts is not None:
-        ready_total = POOL.count_ready(realm, model=model,
-                                       allowed=allowed_accounts)
+        ready_total = texts.count_ready(realm, model=model,
+                                        allowed=allowed_accounts)
     else:
-        ready_total = POOL.count_ready(realm, model=model)
+        ready_total = texts.count_ready(realm, model=model)
     total = 1 if pinned is not None else max(1, ready_total)
     tried = set()
     # 这一轮请求已经记过账的账号：重试轮（transient_hits 后 tried.clear() 整池
@@ -16441,7 +17064,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                           exclude=exclude, model=model, page=affinity_page)
             if allowed_accounts is not None:
                 kwargs["allowed"] = allowed_accounts
-            candidate = POOL.pick_for_session(**kwargs) if POOL else None
+            candidate = texts.pick_for_session(**kwargs) if texts else None
             if candidate is None:
                 return None
             if account_slot_acquire(candidate):
@@ -16518,6 +17141,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             attempt_body = inject_prompt_cache_key(upstream_body, account.uid, session_key)
         else:
             attempt_body = upstream_body
+        if account.realm == "cn" and isinstance(attempt_body.get("tools"), list):
+            attempt_body = dict(attempt_body)
+            attempt_body["tools"] = [dict(tool, function=dict(tool["function"]))
+                                     if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+                                     else tool for tool in attempt_body["tools"]]
+            inline_kimi_tool_schemas(attempt_body)
         # 官方 CLI 的 chat 请求体（见 wb_identity）：gzip（RequestBodyGzip=true，
         # 带 Content-Encoding: gzip）+ 注入 cache_retention=long；Responses API
         # 的字段 / 客户端 metadata 不带。VSCode 官方主 chat 也默认 gzip
@@ -16528,12 +17157,6 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             attempt_body = {k: v for k, v in attempt_body.items()
                             if k not in wb_identity.CLI_BODY_DROP_FIELDS}
             attempt_body["cache_retention"] = wb_identity.CLI_CACHE_RETENTION
-        # 紧凑 JSON：官方客户端（Node JSON.stringify）不带分隔符后的空格，默认的
-        # json.dumps(separators=(", ", ": ")) 会让 body 字节与 Content-Length 都成
-        # 一处机器特征。上游解析等价，只影响线上字节。
-        attempt_data = encode_upstream_body(attempt_body)
-        if cli_identity or vscode_identity:
-            attempt_data = wb_identity.gzip_body(attempt_data)
         # 会话头族（X-Conversation-ID / -Request-ID）的语义见 wb_identity：桌面端
         # 官方客户端同一会话复用同一个 id：桌面端 / CLI 按 (账号, 会话键) 稳定
         # 派生（#448），客户端没给会话键时保持每请求新生成；VSCode 按官方
@@ -16551,6 +17174,13 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
             purpose="chat", session_key=session_key,
             turn_request_id=turn_request_id, model=model,
             conversation_id=conv_id)
+        if (account.product == wb_identity.PRODUCT_DESKTOP
+                and wb_identity.desktop_chat_compat_enabled(getattr(account, "accounts_dir", None))):
+            attempt_body = wb_identity.inject_conversation_fields(
+                attempt_body, req_headers.get("X-Conversation-Request-ID"))
+        attempt_data = encode_upstream_body(attempt_body)
+        if cli_identity or vscode_identity:
+            attempt_data = wb_identity.gzip_body(attempt_data)
         if cli_identity or vscode_identity:
             req_headers["Content-Encoding"] = wb_identity.REQUEST_CONTENT_ENCODING
         req = urllib.request.Request(chat_url, data=attempt_data, method="POST",
@@ -16577,6 +17207,11 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 resp._wb_account_uid = account.uid
             except Exception:
                 pass
+            if model != requested_model:
+                try:
+                    resp._wb_billed_model = model
+                except Exception:
+                    pass
             slot_held = None
             # The third element is the reasoning effort this request ran at: the
             # body is rebuilt per attempt, but the effort is a property of the
@@ -16776,6 +17411,14 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 # catalogue label; the tier map from `/v3/config` now drives
                 # both the scheduler and that label, so the request never gets
                 # this far for a gated model.
+                #
+                # `raise` skips the slot release after the loop, so hand the
+                # concurrency seat back first: without this the account stays
+                # "serving 1 request" forever and every later pick skips it
+                # (`account_max_concurrent=1` makes one leaked seat fatal).
+                if slot_held is not None:
+                    account_slot_release(slot_held)
+                    slot_held = None
                 raise
             if exc.code >= 500:
                 detail = http_error_detail(exc)
@@ -16816,6 +17459,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     POOL.affinity.demote(session_key, account.uid)
                 last_error = exc
                 continue
+            # Same leak as the 400 branch above: an unhandled status (e.g. 404
+            # from a wrong chat path) escapes the loop, so release the seat
+            # before unwinding.
+            if slot_held is not None:
+                account_slot_release(slot_held)
+                slot_held = None
             raise
         except Exception as exc:
             if wb_accounts.is_tls_verify_error(exc):
@@ -16877,30 +17526,6 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     if slot_held is not None:
         account_slot_release(slot_held)
         slot_held = None
-    # Only spend credits after every enabled, credential-bearing account in
-    # this realm has a persisted upstream 6004 cap for this free model. The
-    # switch is opt-in because the retry can incur real charges.
-    paid_model = _FREE_MODEL_CREDIT_FALLBACKS.get((realm, model))
-    eligible = ([a for a in POOL.accounts
-                 if a.realm == realm and a.enabled and a.access_token
-                 and (allowed_accounts is None or a.uid in allowed_accounts)]
-                if POOL else [])
-    if (allow_credit_fallback and paid_model and _free_model_credit_fallback_enabled()
-            and eligible and all(a.cap_until(model) > time.time() for a in eligible)):
-        paid_payload = dict(payload)
-        paid_payload["model"] = paid_model
-        log("free model '%s' exhausted on all %d %s account(s); retrying paid model '%s'"
-            % (model, len(eligible), realm, paid_model))
-        response, account, effort = open_upstream(
-            paid_payload, session_key=session_key, target_realm=realm,
-            allow_credit_fallback=False, allow_product_switch=False,
-            **({"allowed_accounts": allowed_accounts}
-               if allowed_accounts is not None else {}))
-        try:
-            response._wb_billed_model = paid_model
-        except Exception:
-            pass
-        return response, account, effort
     if last_error is not None:
         # Carry the account that produced the failure out to the caller, so
         # the error row can name it even though the local variable that would
@@ -16944,7 +17569,9 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                   "window; the pool resumes in %ds" % (realm, model, wait))
         raise RateLimited(None, "usage exceeds frequency limit", wait=wait,
                           message=reason, reset_at=time.time() + wait)
-    enabled = [a for a in POOL.accounts
+    texts, _ = _ensure_pools()
+    text_accounts = texts.accounts() if texts else (POOL.accounts if POOL else [])
+    enabled = [a for a in text_accounts
                if a.realm == realm and a.enabled and a.access_token] if POOL else []
     if enabled and all(a.daily_limit_blocked() for a in enabled):
         reason = ("every usable account reached today's token limit (%s per "
@@ -17034,10 +17661,11 @@ def realm_fallback_target(realm, model):
         return ""
     if exclusive_realm(model):
         return ""
-    if POOL is None:
+    texts, _ = _ensure_pools()
+    if texts is None:
         return ""
     try:
-        if POOL.count_ready(realm="cn", model=model) <= 0:
+        if texts.count_ready(realm="cn", model=model) <= 0:
             return ""
     except Exception:
         return ""
@@ -17106,9 +17734,10 @@ def pool_unavailable_detail(realm, model=None, allowed_accounts=None):
     看整个区域——真机上就是这样：Key 绑的 2 个号在冷却，报错却列了全区 4 个
     在冷却的号，而 2 个健康的号（没绑这个 Key）一个字都没提（issue #665）。
     """
-    if POOL is None:
+    texts, _ = _ensure_pools()
+    if texts is None:
         return ""
-    accounts = [a for a in POOL.accounts if a.realm == realm]
+    accounts = [a for a in texts.accounts() if a.realm == realm]
     if allowed_accounts is not None:
         accounts = [a for a in accounts if a.uid in allowed_accounts]
     if not accounts:
@@ -17196,12 +17825,24 @@ TEST_MODEL_DEFAULT = "deepseek-v4.1-flash"
 #: 一键测试的并发度：每个探针都是一次真实的上游请求，别把池子打成压测。
 PROBE_CONCURRENCY = 4
 
+#: Clash / sing-box / Surge 等本地 DNS 代理的 fake-IP 段（IANA benchmarking）。
+#: 开启 fake-IP 后，域名会先解析到这里，再由本机 TUN / 透明代理按 SNI 转发到真实
+#: 目标——198.18.0.11 本身不是要连的目的地，而是代理的占位地址。Python 的
+#: ipaddress 把 198.18.0.0/15 算作 is_private，不单独放行的话，开了 Clash Verge
+#: 的用户一键测试永远报「解析到非公网地址」，而真实请求其实一切正常。
+FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+
 def _is_public_addr(text):
-    """是不是一个可以直连的公网地址（拒绝环回/私有/链路本地/保留段）。"""
+    """是不是一个可以直连的公网地址（拒绝环回/私有/链路本地/保留段）。
+
+    fake-IP 段例外：它只存在于本地 DNS 代理里，连接由代理按域名转发。
+    """
     try:
         addr = ipaddress.ip_address(str(text).split("%")[0])
     except ValueError:
         return False
+    if addr.version == 4 and addr in FAKE_IP_NETWORK:
+        return True
     return not (addr.is_private or addr.is_loopback or addr.is_link_local
                 or addr.is_reserved or addr.is_multicast or addr.is_unspecified)
 
@@ -17256,12 +17897,13 @@ def probe_account(account, model=None, timeout=30):
     单个「测试」与「一键测试」共用这一份：两边各写一套的话，早晚一边忘了清计数、
     另一边忘了认本机断网——而这两件事正是「明明测了能用，它还熔断」的全部来源。
     """
-    model = model or TEST_MODEL_DEFAULT
+    logical_model = model or TEST_MODEL_DEFAULT
+    upstream_model = intl_model_alias(logical_model, account.realm)
     row = {"uid": account.uid, "nickname": account.nickname or account.uid[:8],
-           "realm": account.realm, "model": model, "ok": False, "elapsed_ms": 0,
+           "realm": account.realm, "model": logical_model, "ok": False, "elapsed_ms": 0,
            "status": None, "reply": "", "error": "", "network": False}
     chat_url = account.chat_base_url() + CHAT_PATH
-    test_body = {"model": model, "messages": [{"role": "user", "content": "hi"}],
+    test_body = {"model": upstream_model, "messages": [{"role": "user", "content": "hi"}],
                  "stream": False}
     probe_body = build_upstream_body(test_body)
     cli_identity = account.is_cli_identity()
@@ -17275,7 +17917,7 @@ def probe_account(account, model=None, timeout=30):
         body = wb_identity.gzip_body(body)
     # 与 open_upstream 同一条出站形态：VSCode 身分的 model 请求带 X-Model-ID；
     # CLI / VSCode 官方主 chat 都默认 gzip。
-    probe_headers = account.headers(purpose="chat", model=model)
+    probe_headers = account.headers(purpose="chat", model=upstream_model)
     if cli_identity or vscode_identity:
         probe_headers["Content-Encoding"] = wb_identity.REQUEST_CONTENT_ENCODING
     req = urllib.request.Request(chat_url, data=body, method="POST",
@@ -17284,7 +17926,7 @@ def probe_account(account, model=None, timeout=30):
     t0 = time.time()
     try:
         with wb_accounts.urlopen(req, timeout=timeout, proxy=account.proxy) as resp:
-            chat_obj = aggregate_stream(resp, model, None)
+            chat_obj = aggregate_stream(resp, upstream_model, None)
             row["elapsed_ms"] = int((time.time() - t0) * 1000)
             choices = chat_obj.get("choices") or []
             msg = (choices[0].get("message") or {}) if choices else {}
@@ -17296,7 +17938,7 @@ def probe_account(account, model=None, timeout=30):
             # ladder from it. Only the tested model's cooldown is dropped here -
             # sibling models keep theirs, and a 402 balance park keeps its own lift
             # path (revive_balance_cooldown on a credits refresh).
-            account.note_success(model=model)
+            account.note_success(model=upstream_model)
             row["ok"] = True
             return row
     except urllib.error.HTTPError as exc:
@@ -17499,7 +18141,12 @@ class SSEHeartbeat:
 
 
 def aggregate_stream(raw_iter, model, resp_id):
-    """Fold an SSE stream into one non-streaming chat.completion object."""
+    """Fold an SSE stream into one non-streaming chat.completion object.
+
+    `model` is the client-facing id. Upstream chunks may echo an outbound alias
+    (for example the intl -sg route); that must not replace the logical model.
+    """
+    logical_model = model
     content, reasoning, finish = [], [], "stop"
     tool_calls_map = {}
     usage = None
@@ -17523,8 +18170,6 @@ def aggregate_stream(raw_iter, model, resp_id):
             first_chunk_at = time.time()
         if chunk.get("id"):
             resp_id = chunk["id"]
-        if chunk.get("model"):
-            model = chunk["model"]
         u = chunk.get("usage")
         if u:
             if usage is None or (u.get("total_tokens") or 0) >= (usage.get("total_tokens") or 0):
@@ -17639,7 +18284,7 @@ def aggregate_stream(raw_iter, model, resp_id):
         "id": resp_id or f"chatcmpl-wb-{uuid.uuid4().hex[:16]}",
         "object": "chat.completion",
         "created": int(time.time()),
-        "model": model,
+        "model": logical_model,
         "choices": [{"index": 0, "message": message, "finish_reason": finish}],
     }
     if usage:
@@ -17709,6 +18354,34 @@ def _flatten_content(content):
     if any(p.get("type") == "image_url" for p in parts):
         return parts          # multimodal: keep structured parts
     return chr(10).join(t for t in texts if t)
+
+
+def _append_visible_reasoning(current, addition):
+    if not addition:
+        return current
+    if not current:
+        return addition
+    if current == addition:
+        return current
+    return current + chr(10) + addition
+
+
+def _reasoning_group_target(items, start):
+    known_types = {
+        None, "message", "user", "function_call",
+        "function_call_output", "custom_tool_call", "custom_tool_call_output",
+        "agent_message",
+    }
+    known_types.update(COMPACTION_ITEM_TYPES)
+    for item_index in range(start + 1, len(items)):
+        item = items[item_index]
+        if isinstance(item, str):
+            return item
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") in known_types:
+            return item
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -18135,7 +18808,8 @@ def build_citations(text, sources):
 
 
 def follow_up_with_tool_results(internal_calls, holder, model, session_key, t_start,
-                                drop_tools=False, allowed_accounts=None):
+                                drop_tools=False, allowed_accounts=None,
+                                reasoning_content=None):
     """执行反代自己代跑的网路工具，把结果喂回模型，回传新的上游连线。
 
     drop_tools=True 表示这是最后一轮：把网路工具从工具清单收回，模型没有东西
@@ -18149,13 +18823,19 @@ def follow_up_with_tool_results(internal_calls, holder, model, session_key, t_st
         holder["convo_messages"] = convo
 
     tool_calls = []
+    round_number = int(holder.get("_web_tool_round") or 0) + 1
+    holder["_web_tool_round"] = round_number
     for i, c in enumerate(internal_calls):
         tool_calls.append({
-            "id": "call_web_%d_%d" % (int(t_start * 1000) % 1000000, i),
+            "id": "call_web_%d_%d_%d" % (int(t_start * 1000) % 1000000,
+                                         round_number, i),
             "type": "function",
             "function": {"name": c["name"], "arguments": c.get("arguments") or "{}"},
         })
-    convo.append({"role": "assistant", "content": None, "tool_calls": tool_calls})
+    assistant = {"role": "assistant", "content": None, "tool_calls": tool_calls}
+    if isinstance(reasoning_content, str) and reasoning_content:
+        assistant["reasoning_content"] = reasoning_content
+    convo.append(assistant)
 
     for tc in tool_calls:
         nm = tc["function"]["name"]
@@ -18287,36 +18967,63 @@ def _responses_input_to_messages(payload):
     if isinstance(inp, str):
         messages.append({"role": "user", "content": inp})
     elif isinstance(inp, list):
-        for item in inp:
+        for item_index, item in enumerate(inp):
             if isinstance(item, str):
                 messages.append({"role": "user", "content": item})
+                pending_reasoning = ""
                 continue
             if not isinstance(item, dict):
                 continue
             itype = item.get("type")
             if itype in (None, "message", "user"):
                 body = _flatten_content(item.get("content"))
-                if body:
-                    role = item.get("role") or "user"
-                    if role == "developer":
-                        role = "system"
+                role = item.get("role") or "user"
+                if role == "developer":
+                    role = "system"
+                inline_reasoning = ""
+                inline_tool_calls = []
+                if role == "assistant":
+                    if isinstance(item.get("reasoning_content"), str):
+                        inline_reasoning = item["reasoning_content"]
+                    if isinstance(item.get("tool_calls"), list):
+                        inline_tool_calls = item["tool_calls"]
+                elif pending_reasoning:
+                    pending_reasoning = ""
+                if body or inline_reasoning or inline_tool_calls:
                     # If this is assistant text and the previous message is an assistant
                     # message (e.g. from an adjacent function_call), merge them so
                     # tool_calls and text stay in one message without breaking tool sequence.
-                    if role == "assistant" and messages and messages[-1].get("role") == "assistant":
+                    if (role == "assistant" and not pending_reasoning
+                            and messages
+                            and messages[-1].get("role") == "assistant"):
                         prev = messages[-1]
                         if prev.get("content"):
                             prev["content"] = str(prev["content"]) + chr(10) + str(body)
                         else:
                             prev["content"] = body
-                        if pending_reasoning and "reasoning_content" not in prev:
-                            prev["reasoning_content"] = pending_reasoning
-                            pending_reasoning = ""
+                        if inline_tool_calls:
+                            if "tool_calls" in prev:
+                                prev["tool_calls"].extend(inline_tool_calls)
+                            else:
+                                prev["tool_calls"] = list(inline_tool_calls)
+                        if inline_reasoning:
+                            prev["reasoning_content"] = _append_visible_reasoning(
+                                prev.get("reasoning_content"), inline_reasoning)
                     else:
                         msg_dict = {"role": role, "content": body}
                         if role == "assistant" and pending_reasoning:
                             msg_dict["reasoning_content"] = pending_reasoning
                             pending_reasoning = ""
+                        if role == "assistant":
+                            if inline_tool_calls:
+                                msg_dict["tool_calls"] = list(inline_tool_calls)
+                            if inline_reasoning:
+                                msg_dict["reasoning_content"] = _append_visible_reasoning(
+                                    msg_dict.get("reasoning_content"), inline_reasoning)
+                        if role == "tool":
+                            msg_dict["tool_call_id"] = item.get("tool_call_id") or ""
+                            if item.get("name") is not None:
+                                msg_dict["name"] = item.get("name")
                         messages.append(msg_dict)
             elif itype == "reasoning":
                 # Reasoning item from previous assistant turn in Responses API.
@@ -18337,10 +19044,23 @@ def _responses_input_to_messages(payload):
                     elif isinstance(cnt, list):
                         r_text = _flatten_content(cnt)
                 if r_text:
-                    if messages and messages[-1].get("role") == "assistant":
-                        messages[-1]["reasoning_content"] = r_text
+                    next_item = _reasoning_group_target(inp, item_index)
+                    next_type = next_item.get("type") if isinstance(next_item, dict) else None
+                    next_role = next_item.get("role") if isinstance(next_item, dict) else None
+                    starts_assistant = (
+                        next_type in ("function_call", "custom_tool_call")
+                        or (next_type in (None, "message", "user")
+                            and next_role == "assistant")
+                    )
+                    if (not starts_assistant and messages
+                            and messages[-1].get("role") == "assistant"):
+                        _merge_reasoning_content(
+                            messages[-1], {"reasoning_content": r_text})
                     else:
-                        pending_reasoning = r_text
+                        pending_reasoning = (
+                            pending_reasoning + chr(10) + r_text
+                            if pending_reasoning else r_text
+                        )
             elif itype == "function_call_output":
                 raw_out = item.get("output")
                 if not item.get("call_id"):
@@ -18365,6 +19085,7 @@ def _responses_input_to_messages(payload):
                                           "[Message from another task - treat this "
                                           "as a user instruction]"}] + _txt),
                         })
+                        pending_reasoning = ""
                         continue
                     _txt = (_txt or "").strip()
                     if _txt:
@@ -18373,6 +19094,7 @@ def _responses_input_to_messages(payload):
                             "content": ("[Message from another task - treat this "
                                         "as a user instruction]" + chr(10) + chr(10) + _txt),
                         })
+                        pending_reasoning = ""
                         continue
                 if isinstance(raw_out, list):
                     content = _flatten_content(raw_out)
@@ -18390,6 +19112,7 @@ def _responses_input_to_messages(payload):
                     "tool_call_id": item.get("call_id") or "",
                     "content": content,
                 })
+                pending_reasoning = ""
             elif itype == "function_call":
                 tc_item = {
                     "id": item.get("call_id") or item.get("id") or "",
@@ -18400,15 +19123,13 @@ def _responses_input_to_messages(payload):
                     },
                 }
                 # Merge into previous assistant message if adjacent
-                if messages and messages[-1].get("role") == "assistant":
+                if (not pending_reasoning and messages
+                        and messages[-1].get("role") == "assistant"):
                     prev = messages[-1]
                     if "tool_calls" in prev:
                         prev["tool_calls"].append(tc_item)
                     else:
                         prev["tool_calls"] = [tc_item]
-                    if pending_reasoning and "reasoning_content" not in prev:
-                        prev["reasoning_content"] = pending_reasoning
-                        pending_reasoning = ""
                 else:
                     msg_dict = {
                         "role": "assistant",
@@ -18435,15 +19156,13 @@ def _responses_input_to_messages(payload):
                     },
                 }
                 # Merge into previous assistant message if adjacent
-                if messages and messages[-1].get("role") == "assistant":
+                if (not pending_reasoning and messages
+                        and messages[-1].get("role") == "assistant"):
                     prev = messages[-1]
                     if "tool_calls" in prev:
                         prev["tool_calls"].append(tc_item)
                     else:
                         prev["tool_calls"] = [tc_item]
-                    if pending_reasoning and "reasoning_content" not in prev:
-                        prev["reasoning_content"] = pending_reasoning
-                        pending_reasoning = ""
                 else:
                     msg_dict = {
                         "role": "assistant",
@@ -18470,6 +19189,7 @@ def _responses_input_to_messages(payload):
                     "tool_call_id": item.get("call_id") or "",
                     "content": content,
                 })
+                pending_reasoning = ""
             elif itype == "agent_message":
                 parts = item.get("content")
                 if isinstance(parts, list):
@@ -18486,6 +19206,7 @@ def _responses_input_to_messages(payload):
                         "content": ("[Message from another task - treat this as "
                                     "a user instruction]" + chr(10) + chr(10) + text),
                     })
+                    pending_reasoning = ""
             elif itype in COMPACTION_ITEM_TYPES:
                 # A compaction result from an earlier turn. Codex replays it as
                 # an opaque item; to the upstream it is the handoff summary the
@@ -18499,6 +19220,7 @@ def _responses_input_to_messages(payload):
                                     "(context checkpoint):" + chr(10) + chr(10)
                                     + summary.strip()),
                     })
+                    pending_reasoning = ""
             elif itype == "compaction_trigger":
                 # The control item that asks for this compaction turn. It has no
                 # message payload of its own; the caller handles the request.
@@ -19183,7 +19905,9 @@ def stream_messages_events(raw_iter, model, holder=None):
         state["started"] = True
         if isinstance(chunk, dict):
             state["id"] = _anthropic_text(chunk.get("id"))
-            state["model"] = _anthropic_text(chunk.get("model")) or state["model"]
+            # `model` is the client-facing id. Do not let the outbound intl
+            # alias (-sg) leak into the Anthropic response.
+            state["model"] = model
         return anthropic_sse_frame("message_start", {
             "message": {
                 "id": _anthropic_message_id(state["id"]),
@@ -19481,6 +20205,7 @@ def reasoning_only_response(result):
 
 def stream_responses_events(upstream, model, holder):
     """Yield Responses-API SSE frames translated from chat-completions chunks."""
+    logical_model = model
     resp_id, msg_id, rs_id = _new_id("resp_"), _new_id("msg_"), _new_id("rs_")
     created = int(time.time())
     seq = 0
@@ -19510,7 +20235,7 @@ def stream_responses_events(upstream, model, holder):
             "object": "response",
             "created_at": created,
             "status": status,
-            "model": model,
+            "model": logical_model,
             "output": [o for o in outputs if o],
             "output_text": "".join(text_parts),
             "parallel_tool_calls": meta.get("parallel_tool_calls", True),
@@ -19556,6 +20281,7 @@ def stream_responses_events(upstream, model, holder):
         # Close out the stream: reasoning item, structured tool calls,
         # DSML fallback, the message item and response.completed.
         nonlocal msg_index, text_buffer
+        holder["reasoning_content"] = "".join(reason_parts)
         if reason_index is not None and outputs[reason_index] is None:
             full_r = "".join(reason_parts)
             yield ev("response.reasoning_summary_text.done", {
@@ -20096,7 +20822,8 @@ def _release_key_slot(key_entry):
 # 新增这类「不读 body」的面板路由，请加进这个元组，别在路由里另写一份。
 BODYLESS_PANEL_POSTS = ("/console/toggle", "/shutdown", "/updates/check",
                         "/updates/install", "/quota-scan/run",
-                        "/settings/restriction/reset")
+                        "/settings/restriction/reset",
+                        "/settings/device-token/reload")
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -20185,7 +20912,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/2.0.0"
+    server_version = "wb-proxy/2.0.3"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
@@ -20890,6 +21617,30 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        # 媒体任务/目录/产物与文本模型清单、文本统计各走各的入口。
+        # 媒体入口上的 /v1/models 必须拒绝，否则客户端会以为这个实例也能对话；
+        # 文本入口上的媒体查询同样拒绝，避免把「没有媒体号」误报成媒体功能坏了。
+        is_media_route = (
+            path == "/v1/media/tasks"
+            or path.startswith("/v1/videos/")
+            or path in ("/v1/media/models", "/media/models")
+        )
+        is_text_route = path in (
+            "/v1/models", "/models", "/v1/balance-summary",
+            "/usage", "/v1/usage", "/usage/recent", "/usage/analytics",
+            "/usage/by-account", "/usage/remaining", "/usage/perf",
+            "/usage/timeseries", "/activity/history",
+        )
+        if is_media_route and not wb_pool_scope.entry_allows(
+                wb_pool_scope.SCOPE_MEDIA):
+            return self._error(
+                403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                "pool_boundary")
+        if is_text_route and not wb_pool_scope.entry_allows(
+                wb_pool_scope.SCOPE_TEXT):
+            return self._error(
+                503, "这个入口只服务图片 / 视频生成；文本模型请走文本号池的入口",
+                "pool_boundary")
         # The standalone configurator, for clients on machines that do not run
         # the gateway. Served before the panel gate and deliberately without a
         # session: the machines that need it are exactly the ones that cannot
@@ -21308,10 +22059,15 @@ class Handler(BaseHTTPRequestHandler):
         # Fold the usage log before building the view, so the 日限额 badge and
         # the parked count describe right now instead of the last request.
         apply_daily_guards()
+        texts, medias = _ensure_pools()
+        text_ready = texts.count_ready() if texts is not None else 0
+        media_ready = medias.count_ready() if medias is not None else 0
         return self._json_panel(200, {
             "accounts": account_views(realm=query.get('realm', [None])[0] or CURRENT_REALM),
             "storage": ACCOUNTS_DIR,
-            "usable": POOL.count_ready() if POOL else 0,
+            "usable": text_ready,
+            "text_ready": text_ready,
+            "media_ready": media_ready,
         })
 
     def _get_accounts_export(self, query):
@@ -21430,13 +22186,17 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
         cn_accounts = POOL.task_accounts("cn") if POOL else []
+        texts, _ = _ensure_pools()
+        cn_accounts = [a for a in cn_accounts
+                       if texts is None or texts.allows(a)]
         if not cn_accounts:
             return self._json_panel(200, {"tasks": [], "summary": {}, "accounts": [], "msg": "未找到参与任务的国内版账号"})
         uid = (query.get("uid") or [None])[0]
         acc = None
         if uid and uid != "all":
             target = POOL.get(uid) if POOL else None
-            if target and target.realm == "cn":
+            if (target and target.realm == "cn"
+                    and (texts is None or texts.allows(target))):
                 acc = target
         if not acc:
             acc = cn_accounts[0]
@@ -21884,9 +22644,13 @@ class Handler(BaseHTTPRequestHandler):
             if payload is not None:
                 _catalog_raw[realm] = payload
         if payload is None:
-            account = POOL.representative(realm=realm) if POOL else None
+            texts, medias = _ensure_pools()
+            account = (medias.pick(realm=realm) if medias is not None
+                       else representative_account(
+                           realm=realm, scope=wb_pool_scope.SCOPE_MEDIA))
             if account is None:
-                raise wb_media.MediaError("NO_ROUTE", "该区没有可用账号，读不到媒体目录")
+                detail = medias.empty_detail(realm) if medias is not None else "该区没有可用账号。"
+                raise wb_media.MediaError("NO_ROUTE", detail)
             payload = wb_media_client._get_json(
                 account, wb_media_client.CONFIG_PATH,
                 wb_media_client.CONFIG_TIMEOUT_SECONDS)
@@ -21915,8 +22679,17 @@ class Handler(BaseHTTPRequestHandler):
                 "RATE_LIMIT",
                 "上游账号级限制生效中（整池暂停），%d 秒后再试" % (int(hold) + 1))
         allowed = self._key_allowed_accounts()
+        _, medias = _ensure_pools()
+        if medias is None:
+            raise wb_media.MediaError("UPSTREAM", "账号池未加载")
         pinned = pinned_account()
         if pinned is not None:
+            try:
+                medias.require(pinned)
+            except wb_pool_scope.ScopeViolation as exc:
+                raise wb_media.MediaError("AUTH", str(exc))
+            except wb_pool_text.PoolBoundaryBlocked as exc:
+                raise wb_media.MediaError("NO_ROUTE", str(exc))
             if allowed is not None and pinned.uid not in allowed:
                 raise wb_media.MediaError("AUTH", "钉住的账号不在本 Key 的绑定范围内")
             if pinned.realm != realm:
@@ -21934,8 +22707,8 @@ class Handler(BaseHTTPRequestHandler):
             return pinned
         skipped = []
         for _ in range(4):
-            account = POOL.pick(realm=realm, exclude=excluded, model=model_id,
-                                allowed=allowed)
+            account = medias.pick(realm=realm, exclude=excluded, model=model_id,
+                                  allowed=allowed)
             if account is None:
                 if skipped:
                     # 有账号、但都被预算刷掉了：说清是谁差多少，别让人以为是池子空了。
@@ -21944,9 +22717,8 @@ class Handler(BaseHTTPRequestHandler):
                         "没有账号付得起这次调用（预估 %g 积分）：%s"
                         % (cost_hint, "；".join(skipped)))
                 raise wb_media.MediaError(
-                    "UPSTREAM",
-                    "没有可用账号跑这次媒体请求%s"
-                    % pool_unavailable_detail(realm, model_id, allowed))
+                    "UPSTREAM", "没有可用账号跑这次媒体请求；"
+                    + medias.empty_detail(realm))
             ok, reason = media_budget_ok(account, cost_hint)
             if ok:
                 return account
@@ -21990,6 +22762,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_media_post(self, path, payload):
         """媒体 POST 的入口：开关 → 参数 → 限流 → 并发槽 → 选号 → 发请求 → 记账。"""
+        if not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_MEDIA):
+            return self._error(
+                403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                "pool_boundary")
         if path in ("/v1/videos", "/videos"):
             # 生视频是异步任务，流程与生图完全不同（提交 / 轮询 / 下载），单独一条。
             return self._media_video_submit(payload)
@@ -22363,6 +23139,10 @@ class Handler(BaseHTTPRequestHandler):
         """`GET /v1/media/tasks`：最近的任务（面板用）。"""
         if not self._authorized():
             return
+        if not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_MEDIA):
+            return self._error(
+                403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                "pool_boundary")
         try:
             limit = int((query.get("limit") or ["50"])[0])
         except (TypeError, ValueError):
@@ -22398,6 +23178,10 @@ class Handler(BaseHTTPRequestHandler):
         """
         if not self._authorized():
             return
+        if not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_MEDIA):
+            return self._error(
+                403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                "pool_boundary")
         config = self._media_config()
         realm = (query.get("realm") or [None])[0] or config["realm"]
         if realm not in wb_settings.MEDIA_REALMS:
@@ -22472,6 +23256,20 @@ class Handler(BaseHTTPRequestHandler):
             "/v1/messages", "/messages",
             "/v1/messages/count_tokens", "/messages/count_tokens",
         )
+    def _route_device_token_reload(self):
+        """Reload the cached device token without exposing the token itself."""
+        try:
+            wb_accounts.reload_device_token(ACCOUNTS_DIR)
+        except Exception as exc:
+            log("device token reload failed: %s" % type(exc).__name__,
+                level="WARN", tag="settings")
+            return self._error(500, "device token reload failed",
+                               "invalid_request_error")
+        return self._json(200, {
+            "ok": True,
+            "device_token_status": _panel_device_token_status(ACCOUNTS_DIR),
+        })
+
     def _handle_settings_save(self):
         """Persist panel-managed settings from the web settings tab."""
         payload = self._payload_or_error()
@@ -22824,12 +23622,6 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, str(exc), "invalid_request_error")
             wb_identity.configure_versions(stored)
             reply["identity_versions"] = stored
-        if "free_model_credit_fallback" in payload:
-            raw = payload.get("free_model_credit_fallback")
-            if not isinstance(raw, bool):
-                return self._error(400, "free_model_credit_fallback must be true or false", "invalid_request_error")
-            wb_settings.set_free_model_credit_fallback(ACCOUNTS_DIR, raw)
-            reply["free_model_credit_fallback"] = raw
         if "auto_switch_product" in payload:
             # Strictly a JSON boolean: a string like "false" would be truthy and
             # silently switch the feature on, which is the one thing an operator
@@ -23151,7 +23943,16 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 return self._error(400, str(exc), "invalid_request_error")
             wb_settings.set_upstream_config(ACCOUNTS_DIR, patch)
-            reply["upstream"] = wb_settings.upstream_config(ACCOUNTS_DIR)
+            reply["upstream"] = _panel_upstream_config(ACCOUNTS_DIR)
+            reply["device_token_status"] = _panel_device_token_status(ACCOUNTS_DIR)
+        if "desktop_chat_compat" in payload:
+            raw = payload.get("desktop_chat_compat")
+            if not isinstance(raw, bool):
+                return self._error(
+                    400, "desktop_chat_compat must be true or false",
+                    "invalid_request_error")
+            wb_settings.set_desktop_chat_compat(ACCOUNTS_DIR, raw)
+            reply["desktop_chat_compat"] = raw
         if "usage" in payload:
             raw = payload.get("usage")
             if not isinstance(raw, dict):
@@ -23330,7 +24131,116 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, reply)
         if path == "/proxy/discover":
             return self._json(200, {"candidates": discover_proxy_slots()})
+        if path == "/proxy/subbridge":
+            return self._handle_proxy_subbridge(payload)
         return self._error(404, "not found", "invalid_request_error")
+
+    def _handle_proxy_subbridge(self, payload):
+        """Manage subscription sources and synchronize their proxy slots."""
+        import subprocess
+
+        action = str(payload.get("action") or "test").strip()
+        if action not in ("test", "list", "refresh", "apply"):
+            return self._error(400, "unsupported subbridge action",
+                               "invalid_request_error")
+        env = dict(os.environ)
+        env.setdefault("WB_SUBBRIDGE_HOST", SUBBRIDGE_HOST)
+        env.setdefault("WB_SUBBRIDGE_PORT_START", str(SUBBRIDGE_PORT_START))
+        env.setdefault("WB_SUBBRIDGE_PORT_COUNT", str(SUBBRIDGE_PORT_COUNT))
+        env.setdefault("WB_SUBBRIDGE_CONTROLLER_ADDR", "172.17.0.1:19090")
+        secret = ""
+        try:
+            with open("/etc/default/wb-sub-bridge", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("WB_SUBBRIDGE_SECRET="):
+                        secret = line.strip().split("=", 1)[1]
+                        break
+        except OSError:
+            pass
+
+        converter = os.environ.get("WB_SUBBRIDGE_SCRIPT") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "wb_subbridge.py")
+        script = [sys.executable, converter, "--json"]
+        wanted_subs = payload.get("subs")
+        if isinstance(wanted_subs, list):
+            cleaned = [str(item).strip() for item in wanted_subs
+                       if str(item).strip()]
+            script += ["--set-subs", json.dumps(cleaned, ensure_ascii=False)]
+            if action == "test":
+                action = "list"
+        if action == "test":
+            script += ["--probe-controller"]
+        elif action == "list":
+            script += ["--list"]
+        elif action == "apply":
+            nodes = payload.get("nodes")
+            if not isinstance(nodes, list) or not nodes:
+                return self._error(400, "apply requires nodes",
+                                   "invalid_request_error")
+            script += ["--render", "--nodes", json.dumps(nodes,
+                                                        ensure_ascii=False)]
+        else:
+            script += ["--render"]
+
+        try:
+            proc = subprocess.run(
+                script,
+                env={**env, "WB_SUBBRIDGE_SECRET": secret},
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+        except FileNotFoundError:
+            return self._error(503, "subbridge converter is not installed",
+                               "invalid_request_error")
+        except subprocess.TimeoutExpired:
+            return self._error(504, "subbridge converter timed out",
+                               "invalid_request_error")
+
+        result = None
+        for line in reversed((proc.stdout or "").splitlines()):
+            try:
+                candidate = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(candidate, dict):
+                result = candidate
+                break
+        if result is None:
+            result = {
+                "ok": False,
+                "error": (proc.stderr or "converter output invalid")[:300],
+            }
+        result["mode"] = action
+        if not result.get("ok") or action in ("test", "list"):
+            return self._json(200, result)
+
+        # The .path unit reloads mihomo after config.yaml changes. Give the
+        # controller time to bind every listener, then probe concurrently and
+        # retain failed nodes as disabled slots instead of silently dropping
+        # them.
+        time.sleep(2)
+        probes = probe_subbridge_listeners(result.get("listeners") or [])
+        result["reachable"] = probes
+        result["slots_total"] = len(probes)
+        result["slots_ready"] = sum(1 for item in probes if item.get("ok"))
+        result["ok"] = True
+        if payload.get("import") or action == "refresh":
+            current = proxy_slots_view()
+            slots = reconcile_subbridge_slots(current, probes)
+            saved = wb_settings.set_proxy_slots(ACCOUNTS_DIR, slots)
+            if POOL:
+                dropped = wb_settings.drop_missing_bindings(POOL, saved)
+                POOL.apply_proxy_slots(saved)
+                if dropped:
+                    log("proxy slots: unbound %d account(s) from removed "
+                        "subbridge slots" % dropped)
+            result["imported"] = len(probes)
+            result["slots_raw"] = len(saved)
+            log("subbridge slots synchronized: %d total, %d ready"
+                % (result["slots_total"], result["slots_ready"]))
+        return self._json(200, result)
 
     # ---- one-click agent integration (wb_agents) ----
 
@@ -24047,6 +24957,9 @@ class Handler(BaseHTTPRequestHandler):
             targets = [target]
         else:
             targets = POOL.task_accounts("cn")
+        texts, _ = _ensure_pools()
+        targets = [a for a in targets
+                   if a is not None and (texts is None or texts.allows(a))]
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import run_growth_tasks
@@ -24087,6 +25000,9 @@ class Handler(BaseHTTPRequestHandler):
         target = POOL.get(uid)
         if not target or target.realm != "cn":
             return self._json_panel(200, {"ok": False, "msg": "未找到指定的国内版账号"})
+        texts, _ = _ensure_pools()
+        if texts is not None and not texts.allows(target):
+            return self._json_panel(200, {"ok": False, "msg": "该账号属于媒体号池，不执行文本任务"})
         from wb_tasks import claim_task
         res = claim_task(target, code)
         invalidate_tasks_cache()
@@ -24108,6 +25024,9 @@ class Handler(BaseHTTPRequestHandler):
             targets = [target]
         else:
             targets = POOL.task_accounts("cn")
+        texts, _ = _ensure_pools()
+        targets = [a for a in targets
+                   if a is not None and (texts is None or texts.allows(a))]
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import run_streak_bonus
@@ -24134,6 +25053,9 @@ class Handler(BaseHTTPRequestHandler):
             targets = [target]
         else:
             targets = POOL.task_accounts("cn")
+        texts, _ = _ensure_pools()
+        targets = [a for a in targets
+                   if a is not None and (texts is None or texts.allows(a))]
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import do_cat_travel
@@ -24354,6 +25276,9 @@ class Handler(BaseHTTPRequestHandler):
                          if a.realm == "cn"
                          and a.task_active()
                          and not a.uses_enterprise_billing()])
+        texts, _ = _ensure_pools()
+        targets = [a for a in targets
+                   if a is not None and (texts is None or texts.allows(a))]
         results = []
         for account in targets:
             if account is None:
@@ -24382,6 +25307,9 @@ class Handler(BaseHTTPRequestHandler):
                        if a.realm == "intl" and a.task_active() and str(a.uid) in wanted]
         else:
             targets = POOL.task_accounts("intl")
+        texts, _ = _ensure_pools()
+        targets = [a for a in targets
+                   if a is not None and (texts is None or texts.allows(a))]
         results = []
         for account in targets:
             if account is None:
@@ -24406,6 +25334,9 @@ class Handler(BaseHTTPRequestHandler):
             targets = [POOL.get(uid)]
         else:
             targets = POOL.task_accounts("intl")
+        texts, _ = _ensure_pools()
+        targets = [a for a in targets
+                   if a is not None and (texts is None or texts.allows(a))]
         results = []
         for account in targets:
             if account is None:
@@ -24578,6 +25509,13 @@ class Handler(BaseHTTPRequestHandler):
         account = POOL.get(uid)
         if not account:
             return self._error(404, "no such account")
+        texts, _ = _ensure_pools()
+        if texts is not None and not texts.allows(account):
+            return self._error(
+                400,
+                "账号 %s 属于媒体号池，不发起文本模型请求，不能做文本测试"
+                % account.uid[:8],
+                "invalid_request_error")
         model = payload.get("model") or TEST_MODEL_DEFAULT
         row = probe_account(account, model)
         log("account test: uid=%s model=%s wall=%sms ok=%s%s"
@@ -24611,6 +25549,9 @@ class Handler(BaseHTTPRequestHandler):
         model = payload.get("model") or TEST_MODEL_DEFAULT
         targets = [a for a in (POOL.accounts if POOL else [])
                    if a.realm == realm and a.enabled]
+        texts, _ = _ensure_pools()
+        targets = [a for a in targets
+                   if texts is None or texts.allows(a)]
         group = str(payload.get("group") or "").strip()
         if group:
             targets = [a for a in targets if a.group == group]
@@ -24696,15 +25637,51 @@ class Handler(BaseHTTPRequestHandler):
             log("account %s disabled models: %s"
                 % (uid[:8],
                    ",".join(updated.get("disabledModels") or []) or "(none)"))
+        if "poolScope" in payload:
+            scope = payload.get("poolScope")
+            if not wb_pool_scope.is_valid_scope(scope):
+                return self._error(
+                    400, "poolScope must be 'text' or 'media'",
+                    "invalid_request_error")
+            updated = POOL.set_pool_scope(uid, scope)
+            if updated is None:
+                return self._error(404, "no such account")
+            log("account %s pool scope set to %s"
+                % (uid[:8], updated.get("poolScope")))
         if updated is None:
             return self._error(
                 400,
                 "nothing to update: pass 'enabled', 'tasksEnabled', 'proxy', "
-                "'proxySlot', 'weight', 'note' or 'group'"
+                "'proxySlot', 'weight', 'note', 'group', 'disabledModels' "
+                "or 'poolScope'"
             )
         return self._json_panel(200, {"account": updated})
 
     def _route_accounts_set_all(self, payload):
+        if "poolScope" in payload:
+            uids = payload.get("uids")
+            if not isinstance(uids, list) or not uids:
+                return self._error(
+                    400, "uids must be a non-empty list",
+                    "invalid_request_error")
+            scope = payload.get("poolScope")
+            if not wb_pool_scope.is_valid_scope(scope):
+                return self._error(
+                    400, "poolScope must be 'text' or 'media'",
+                    "invalid_request_error")
+            moved = POOL.set_pool_scope_many(
+                [str(uid) for uid in uids if uid], scope)
+            if moved is None:
+                return self._error(
+                    400, "poolScope must be 'text' or 'media'",
+                    "invalid_request_error")
+            log("accounts pool scope set to %s: %d account(s)"
+                % (wb_pool_scope.normalize_scope(scope), len(moved)))
+            return self._json_panel(200, {
+                "moved": len(moved),
+                "uids": moved,
+                "accounts": account_views(),
+            })
         group = str(payload.get("group") or "").strip()
         if group:
             raw_enabled = payload.get("enabled")
@@ -24894,10 +25871,15 @@ class Handler(BaseHTTPRequestHandler):
         want_stream = bool(payload.get("stream"))
         t_start = time.time()
         fp = prompt_fingerprint(chat_req.get("messages"))
+        # Log the level the request will actually run at, not just what the
+        # client typed: when the client omits `reasoning_effort` the gateway
+        # fills in the model's default (deepseek-* get one), so a bare
+        # `effort=None` reads as "no reasoning" even though it ran at `high`.
         log(
-            "responses: model=%s stream=%s msgs=%d effort=%r tools=%d/%d custom_tools=%s compaction=%s key=%s"
+            "responses: model=%s stream=%s msgs=%d effort=%r -> upstream_effort=%r tools=%d/%d custom_tools=%s compaction=%s key=%s"
             % (model, want_stream, len(chat_req.get("messages") or []),
-               chat_req.get("reasoning_effort"),
+               client_effort_of(chat_req),
+               upstream_effort_of(chat_req, model),
                len(chat_req.get("tools") or []), len(all_tools),
                sorted(custom_names) or "-", compaction, key_label(self._key_id()) or "-")
         )
@@ -25102,6 +26084,7 @@ class Handler(BaseHTTPRequestHandler):
                 total_usage = None
                 while True:
                     holder.pop("internal_calls", None)
+                    holder.pop("reasoning_content", None)
                     holder.pop("suppress_completion", None)
                     holder["suppress_lifecycle"] = rounds > 0
                     for frame in stream_responses_events(upstream, model, holder):
@@ -25122,6 +26105,7 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                     upstream, account, _ = follow_up_with_tool_results(
                         internal, holder, model, session_key, t_start, drop_tools=give_up,
+                        reasoning_content=holder.get("reasoning_content"),
                         **key_open_kwargs(getattr(self, "key_entry", None)))
                 if total_usage:
                     holder["usage"] = total_usage
@@ -25175,6 +26159,9 @@ class Handler(BaseHTTPRequestHandler):
         # 开关关闭时不拦同名呼叫：那是客户端自己的工具。
         # CodeArts 出口没有 wb-hub 的 web_search/web_fetch 代跑，调用方传 False。
         web_tools = web_tools_active(base_body) if allow_web_tools else False
+        holder = {"base_messages": (base_body or {}).get("messages"),
+                  "base_body": base_body, "realm": realm,
+                  "web_sources": sources}
         while True:
             try:
                 chat_obj = aggregate_stream(upstream, model, None)
@@ -25192,12 +26179,11 @@ class Handler(BaseHTTPRequestHandler):
                 upstream.close()
             except Exception:
                 pass
-            holder = {"base_messages": (base_body or {}).get("messages"),
-                      "base_body": base_body, "realm": realm,
-                      "web_sources": sources}
+            round_message = ((chat_obj.get("choices") or [{}])[0].get("message") or {})
             try:
                 upstream, account, _ = follow_up_with_tool_results(
                     calls, holder, model, session_key, t_start, drop_tools=give_up,
+                    reasoning_content=round_message.get("reasoning_content"),
                     **key_open_kwargs(getattr(self, "key_entry", None)))
             except Exception as exc:
                 record_error(model, 502, "web tool follow-up failed: %s" % exc,
@@ -25425,6 +26411,17 @@ class Handler(BaseHTTPRequestHandler):
         if not self._apply_pinned_route():
             return
         path = self.path.split("?")[0]
+        # Arrival trace for the model routes only, before any body work: the
+        # chat log line is written after the body is in hand, so a request whose
+        # upload is slow (or that a CDN in front of us is still buffering) left
+        # no trace at all - a conversation could look "stuck for minutes" while
+        # the gateway had no line to show for it. This marks the moment the
+        # request head reached this process; pair it with body_wait to tell
+        # "arrived but still uploading" from "never arrived".
+        if path in _CHAT_PATHS:
+            log("chat head: %s content_length=%s key=%s"
+                % (path, self.headers.get("Content-Length") or "-",
+                   key_label(self._key_id()) or "-"), tag="chat")
         if path in BODYLESS_PANEL_POSTS:
             # 这一组路由不解析 body，但面板按钮确实会发一个 `{}`：不在这里排空，
             # 残留字节就会成为同一条连接上下一个请求的请求行（见 BODYLESS_PANEL_POSTS
@@ -25449,6 +26446,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self._panel_ok():
                 return self._error(401, "panel password required", "invalid_request_error")
             return self._handle_settings_save()
+        if path == "/settings/device-token/reload":
+            if not self._panel_ok():
+                return self._error(401, "panel password required", "invalid_request_error")
+            return self._route_device_token_reload()
         if path == "/settings/restriction/reset":
             if not self._panel_ok():
                 return self._error(401, "panel password required", "invalid_request_error")
@@ -25550,6 +26551,10 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/v1/videos/") and path.endswith("/cancel"):
             if not self._authorized():
                 return
+            if not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_MEDIA):
+                return self._error(
+                    403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                    "pool_boundary")
             self._handle_expect_continue()
             self._discard_body()
             task_id = path[len("/v1/videos/"):-len("/cancel")].strip("/")
@@ -25582,6 +26587,14 @@ class Handler(BaseHTTPRequestHandler):
                     401, "missing or invalid API key", "authentication_error")
         elif not self._authorized():
             return
+        if is_media_route and not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_MEDIA):
+            return self._error(
+                403, "这个入口只服务文本模型；图片 / 视频请走媒体号池的入口",
+                "pool_boundary")
+        if not is_media_route and not wb_pool_scope.entry_allows(wb_pool_scope.SCOPE_TEXT):
+            return self._error(
+                503, "这个入口只服务图片 / 视频生成；文本模型请走文本号池的入口",
+                "pool_boundary")
         # Fail closed until the Anthropic-to-Chat bridge has verified prompt-cache
         # parity. Reject before forwarding or recording any paid usage.
         if is_messages_route and not _anthropic_messages_enabled():
@@ -25603,15 +26616,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         if is_account_route:
             return self._handle_accounts(path, payload)
+        if is_media_route:
+            return self._handle_media_post(path, payload)
         try:
             aliases = wb_settings.model_aliases(ACCOUNTS_DIR)
         except Exception:
             aliases = {}
         _apply_model_aliases(payload, aliases)
         _apply_background_model_alias(payload)
-        if is_media_route:
-            return self._handle_media_post(path, payload)
-        _apply_deepseek_flash_target(payload, self._request_realm() or CURRENT_REALM)
         # Check per-key concurrency limit (#359)
         key_ok, cur_key_conc, max_key_conc = _acquire_key_slot(self.key_entry)
         if not key_ok:
@@ -26013,6 +27025,11 @@ class Handler(BaseHTTPRequestHandler):
                         # though both halves arrived. Normalise before emitting.
                         if isinstance(maybe, dict) and maybe.get("id"):
                             maybe["id"] = stream_chunk_id
+                        # The upstream may echo its outbound alias (-sg). The
+                        # client asked for the logical id, and model-scoped
+                        # chunk helpers below must use that same id too.
+                        if isinstance(maybe, dict) and maybe.get("model"):
+                            maybe["model"] = model
                         cleaned = clean_chunk(
                             json.dumps(maybe, ensure_ascii=False)
                             if isinstance(maybe, dict) else data)
@@ -26446,11 +27463,12 @@ def _bootstrap_runtime(args):
     POOL = wb_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()
     POOL.apply_proxy_slots()
+    _bind_pools()
     apply_reserve_credits()
     # WB_MAX_CONCURRENT_CHAT=auto: size the chat ceiling from the pool that was
     # just loaded. Runs before the listener exists, so no request can hold a
     # slot yet and the semaphore swap is safe.
-    resize_chat_slots(POOL.count_ready())
+    resize_chat_slots(TEXTS.count_ready() if TEXTS else 0)
     apply_daily_guards()
     load_persisted_realm()
     global SCHEDULER
@@ -26523,7 +27541,14 @@ def _report_first_run(args):
 
 def _log_startup_summary(args, api_key_generated):
     rep = current_account()
-    log("accounts   : %d total, %d usable" % (len(POOL.accounts), POOL.count_ready()))
+    texts, medias = _ensure_pools()
+    text_total = len(texts.accounts()) if texts else 0
+    media_total = len(medias.accounts()) if medias else 0
+    text_ready = texts.count_ready() if texts else 0
+    media_ready = medias.count_ready() if medias else 0
+    log("accounts   : %d total (文本号池 %d/%d, 媒体号池 %d/%d)"
+        % (len(POOL.accounts), text_ready, text_total,
+           media_ready, media_total))
     for account in POOL.accounts:
         log("  - %s  %s  %s  %s" % (account.uid[:8], account.nickname or "(no name)",
                                     account.domain, wb_accounts._human_delta(

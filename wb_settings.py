@@ -147,6 +147,24 @@ ACCOUNT_MAX_CONCURRENT_KEY = "account_max_concurrent"
 ACCOUNT_MAX_CONCURRENT_MAX = 10
 
 
+DESKTOP_CHAT_COMPAT_KEY = "desktop_chat_compat"
+
+
+def desktop_chat_compat(accounts_dir):
+    """Whether desktop chat requests use the SDK-compatible wire profile."""
+    return load(accounts_dir).get(DESKTOP_CHAT_COMPAT_KEY) is True
+
+
+def set_desktop_chat_compat(accounts_dir, enabled):
+    """Persist the desktop chat compatibility switch and return its value."""
+    enabled = bool(enabled)
+    with _lock:
+        data = load(accounts_dir)
+        data[DESKTOP_CHAT_COMPAT_KEY] = enabled
+        save(accounts_dir, data)
+    return enabled
+
+
 def account_max_concurrent(accounts_dir):
     """How many chat requests one upstream account may run at once.
 
@@ -1899,21 +1917,6 @@ def set_enable_anthropic_messages(accounts_dir, enabled):
     with _lock:
         data = load(accounts_dir)
         data["enable_anthropic_messages"] = enabled
-        save(accounts_dir, data)
-    return enabled
-
-
-def free_model_credit_fallback(accounts_dir):
-    """Whether exhausted free models (deepseek-v4.1-flash) can fall back to credit siblings."""
-    return load(accounts_dir).get("free_model_credit_fallback") is True
-
-
-def set_free_model_credit_fallback(accounts_dir, enabled):
-    """Persist the free model credit fallback toggle. Returns the stored boolean."""
-    enabled = bool(enabled)
-    with _lock:
-        data = load(accounts_dir)
-        data["free_model_credit_fallback"] = enabled
         save(accounts_dir, data)
     return enabled
 
